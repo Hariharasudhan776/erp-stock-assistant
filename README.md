@@ -177,6 +177,13 @@ the model.
 ollama pull qwen3:8b       # once; then pick "Local model via Ollama" in the admin panel
 ```
 
+## Backups
+
+Everything the assistant knows lives in files that are deliberately not in this repository:
+`knowledge.py`, `data/` (users, settings, learned notes, group mapping), `logs/` and `.env`.
+`backup.cmd` copies them to a dated folder on another drive; run it by hand or schedule it with
+Windows Task Scheduler (daily, "Start a program", pointing at `backup.cmd`).
+
 ## Public access
 
 The app has to run where it can reach the database, so "hosting" means a tunnel from that
