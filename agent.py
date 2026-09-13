@@ -1,9 +1,10 @@
-"""Claude agent loop for the stock assistant.
+"""Agent loop for the stock assistant.
 
-One `Chat` per signed-in browser session. A manual tool loop (not the beta tool
-runner) because we own the history across turns, stream text to the page, trim old
-tool results, enforce the session's table allow-list on every tool call, log usage
-per user and roll a half-finished exchange back when the user presses Stop.
+One `Chat` per signed-in browser session. A manual tool loop over a provider
+(`providers.AnthropicProvider` or `providers.OllamaProvider`), because we own the
+history across turns, stream text to the page, trim old tool results, enforce the
+session's table allow-list on every tool call, log usage per user and roll a
+half-finished exchange back when the user presses Stop.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import oracledb
 import db
 import erp_roles
 import policy
+import providers
 import store
 from config import CFG, LOGS
 
@@ -51,13 +53,10 @@ def price_for(model: str) -> tuple[float, float]:
     return (5.0, 25.0)
 
 
-def cost_of(model: str, usage) -> float:
+def cost_of(model: str, usage: dict) -> float:
     inp, out = price_for(model)
-    u = usage
-    cost = (getattr(u, "input_tokens", 0) or 0) * inp
-    cost += (getattr(u, "cache_creation_input_tokens", 0) or 0) * inp * CACHE_WRITE_MULT
-    cost += (getattr(u, "cache_read_input_tokens", 0) or 0) * inp * CACHE_READ_MULT
-    cost += (getattr(u, "output_tokens", 0) or 0) * out
+    cost = usage.get("input", 0) * inp + usage.get("cache_write", 0) * inp * CACHE_WRITE_MULT
+    cost += usage.get("cache_read", 0) * inp * CACHE_READ_MULT + usage.get("output", 0) * out
     return cost / 1_000_000
 
 
@@ -106,12 +105,13 @@ def usage_summary() -> dict:
         "today": spent_since(1), "last7": spent_since(7), "last30": spent_since(30),
         "questions_today": sum(1 for e in rows if e.get("date") == today),
         "questions_total": len(rows), "by_user_today": by_user,
+        "local_questions": sum(1 for e in rows if e.get("provider") == "ollama"),
     }
 
 
 def cost_estimates() -> dict:
-    """Per-model cost of a typical question, from the measured token profile of recent questions."""
-    rows = [e for e in _usage_rows() if (e.get("input") or e.get("cache_read"))][-60:]
+    """Per-model cost of a typical question, from the measured token profile of recent Claude questions."""
+    rows = [e for e in _usage_rows() if e.get("provider", "anthropic") == "anthropic" and (e.get("input") or e.get("cache_read"))][-60:]
 
     def med(key, default):
         vals = sorted(int(e.get(key) or 0) for e in rows)
@@ -201,20 +201,31 @@ TOOLS = [
 EventFn = Callable[[dict], None]
 
 
+def current_provider(s: dict | None = None):
+    """The provider selected in settings (Claude API or a local Ollama model)."""
+    s = s or store.settings()
+    if s.get("provider") == "ollama":
+        return providers.OllamaProvider(s.get("ollama_url", "http://127.0.0.1:11434"), s.get("ollama_model", "qwen3:8b"))
+    return providers.AnthropicProvider(CFG.anthropic_api_key, s["model"], s["effort"])
+
+
+def model_label(s: dict | None = None) -> str:
+    s = s or store.settings()
+    if s.get("provider") == "ollama":
+        return "local · " + s.get("ollama_model", "?")
+    return s["model"].replace("claude-", "") + " · " + s["effort"]
+
+
 class Chat:
     """One conversation for one signed-in user. Thread-safe for one question at a time."""
 
     def __init__(self, user: str = "local", role: str = "admin", access: dict | None = None) -> None:
-        if not CFG.anthropic_api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is not set in .env")
         if role not in policy.ROLES:
             raise ValueError("bad role")
         self.user, self.role = user, role
         self.access = access or {}
         self.modules_info = erp_roles.module_info(self.access.get("modules", []))
-        # admins are unrestricted; users get their session allow-list (None = default module set)
         self.allowed_tables = None if role == "admin" else (self.access.get("tables") if self.access.get("modules") is not None else None)
-        self.client = anthropic.Anthropic(api_key=CFG.anthropic_api_key, max_retries=3)
         self.messages: list = []
         self.results: list[db.QueryResult] = []
         self.session_cost = 0.0
@@ -225,28 +236,11 @@ class Chat:
         self._transcript = LOGS / f"chat-{self.started:%Y%m%d-%H%M%S}-{user}.md"
 
     # -- request shaping -------------------------------------------------
-    @property
-    def model(self) -> str:
-        return store.settings()["model"]
-
-    def _request_kwargs(self) -> dict:
-        s = store.settings()
-        kw: dict = {
-            "model": s["model"],
-            "max_tokens": 8000,
-            "system": [
-                {"type": "text", "text": SYSTEM_PROMPT},
-                {"type": "text", "text": store.learned_prompt(), "cache_control": {"type": "ephemeral", "ttl": "1h"}},
-                {"type": "text", "text": policy.role_prompt(self.role, self.modules_info)},
-            ],
-            "tools": TOOLS,
-            "messages": self.messages,
-        }
-        m = s["model"]
-        if not (m.startswith("claude-haiku") or m.startswith("claude-sonnet-4-5") or m.startswith("claude-opus-4-5")):
-            kw["thinking"] = {"type": "adaptive"}
-            kw["output_config"] = {"effort": s["effort"]}
-        return kw
+    def _system_blocks(self, provider_name: str) -> list[dict]:
+        learned = {"type": "text", "text": store.learned_prompt()}
+        if provider_name == "anthropic":
+            learned["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        return [{"type": "text", "text": SYSTEM_PROMPT}, learned, {"type": "text", "text": policy.role_prompt(self.role, self.modules_info)}]
 
     def _compact_history(self) -> None:
         last_q = None
@@ -280,13 +274,14 @@ class Chat:
         s = store.settings()
         try:
             if name == "run_sql":
-                emit({"type": "tool", "name": name, "purpose": inp.get("purpose", ""), "sql": inp.get("sql", "")})
+                sql = str(inp.get("sql", ""))
+                emit({"type": "tool", "name": name, "purpose": str(inp.get("purpose", "")), "sql": sql})
                 try:
-                    res = db.run_select(inp["sql"], role=role, max_rows=s["max_rows"], allowed_tables=self.allowed_tables)
+                    res = db.run_select(sql, role=role, max_rows=s["max_rows"], allowed_tables=self.allowed_tables)
                 except ValueError as e:
                     return f"Rejected: {e}", True
                 except PermissionError as e:
-                    store.audit("sql_denied", self.user, role=role, reason=str(e)[:200], sql=inp.get("sql", "")[:300])
+                    store.audit("sql_denied", self.user, role=role, reason=str(e)[:200], sql=sql[:300])
                     emit({"type": "sql_error", "text": "outside this user's privileges"})
                     return f"Denied by policy: {e} Do not retry with another table; tell the user exactly: {policy.REFUSAL}", True
                 except oracledb.Error as e:
@@ -301,17 +296,21 @@ class Chat:
                 return policy.REFUSAL, True
             if name == "describe_table":
                 emit({"type": "tool", "name": name, "purpose": f"describe {inp.get('table', '')}"})
-                return db.describe_table(inp["table"], role=role), False
+                return db.describe_table(str(inp.get("table", "")), role=role), False
             if name == "search_schema":
                 emit({"type": "tool", "name": name, "purpose": f"search schema for {inp.get('keyword', '')}"})
-                return db.search_schema(inp["keyword"], role=role), False
+                return db.search_schema(str(inp.get("keyword", "")), role=role), False
             if name == "sample_rows":
                 emit({"type": "tool", "name": name, "purpose": f"sample {inp.get('table', '')}"})
-                return db.sample_rows(inp["table"], inp.get("n", 5), role=role), False
+                try:
+                    n = int(inp.get("n", 5))
+                except (TypeError, ValueError):
+                    n = 5
+                return db.sample_rows(str(inp.get("table", "")), n, role=role), False
             if name == "save_knowledge":
                 if role != "admin":
                     return "Not permitted for this user.", True
-                note = store.add_note(inp["kind"], inp["text"], by=self.user, question=question)
+                note = store.add_note(str(inp.get("kind", "rule")), str(inp.get("text", "")), by=self.user, question=question)
                 emit({"type": "learned", "kind": note["kind"], "text": note["text"], "id": note["id"]})
                 return f"Saved as {note['kind']} note {note['id']}. It will be available to all future sessions.", False
             return f"Unknown tool {name}", True
@@ -329,16 +328,18 @@ class Chat:
 
     def _ask(self, question: str, emit: EventFn) -> str:
         s = store.settings()
-        spent = spent_today()
-        if spent >= s["daily_budget_usd"]:
-            msg = f"Today's total budget of ${s['daily_budget_usd']:.2f} is used up (spent ${spent:.2f}). An admin can raise it in the admin panel."
-            emit({"type": "error", "text": msg})
-            return msg
-        mine = spent_today(self.user)
-        if mine >= s["user_daily_budget_usd"]:
-            msg = f"Your daily budget of ${s['user_daily_budget_usd']:.2f} is used up (spent ${mine:.2f}). Ask an admin to raise it."
-            emit({"type": "error", "text": msg})
-            return msg
+        local = s.get("provider") == "ollama"
+        if not local:
+            spent = spent_today()
+            if spent >= s["daily_budget_usd"]:
+                msg = f"Today's total budget of ${s['daily_budget_usd']:.2f} is used up (spent ${spent:.2f}). An admin can raise it in the admin panel."
+                emit({"type": "error", "text": msg})
+                return msg
+            mine = spent_today(self.user)
+            if mine >= s["user_daily_budget_usd"]:
+                msg = f"Your daily budget of ${s['user_daily_budget_usd']:.2f} is used up (spent ${mine:.2f}). Ask an admin to raise it."
+                emit({"type": "error", "text": msg})
+                return msg
 
         turn = {"q": question.strip(), "ts": _dt.datetime.now().isoformat(timespec="seconds"), "events": []}
         self.turn_log.append(turn)
@@ -349,12 +350,16 @@ class Chat:
                 turn["events"].append(ev)
             raw_emit(ev)
 
-        store.audit("question", self.user, role=self.role, modules=self.access.get("modules"), text=question.strip()[:300])
+        store.audit("question", self.user, role=self.role, modules=self.access.get("modules"), provider=s.get("provider", "anthropic"), text=question.strip()[:300])
         today = _dt.date.today().strftime("%d/%m/%Y")
         self.messages.append({"role": "user", "content": f"{question.strip()}\n\n[Today is {today}]"})
         self._compact_history()
 
-        model = s["model"]
+        try:
+            provider = current_provider(s)
+        except RuntimeError as e:
+            return self._fail(emit, str(e))
+        model_name = getattr(provider, "model", "?")
         q_cost = 0.0
         usage_tot = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}
         final_text = ""
@@ -370,32 +375,32 @@ class Chat:
                     break
 
                 emit({"type": "status", "text": "thinking" if rounds == 1 else "working on results"})
-                kw = self._request_kwargs()
-                text_this_round = []
-                with self.client.messages.stream(**kw) as stream:
-                    for ev in stream:
-                        if ev.type == "content_block_delta" and ev.delta.type == "text_delta":
-                            text_this_round.append(ev.delta.text)
-                            emit({"type": "text_delta", "text": ev.delta.text})
-                    response = stream.get_final_message()
+                text_this_round: list[str] = []
 
-                u = response.usage
-                q_cost += cost_of(model, u)
-                usage_tot["input"] += u.input_tokens or 0
-                usage_tot["cache_write"] += getattr(u, "cache_creation_input_tokens", 0) or 0
-                usage_tot["cache_read"] += getattr(u, "cache_read_input_tokens", 0) or 0
-                usage_tot["output"] += u.output_tokens or 0
+                def on_text(t: str) -> None:
+                    text_this_round.append(t)
+                    emit({"type": "text_delta", "text": t})
 
-                self.messages.append({"role": "assistant", "content": response.content})
+                reply = provider.stream(self._system_blocks(provider.name), TOOLS, self.messages, on_text)
+                if provider.name == "anthropic":
+                    q_cost += cost_of(reply.model or model_name, reply.usage)
+                for k in usage_tot:
+                    usage_tot[k] += reply.usage.get(k, 0)
 
-                if response.stop_reason == "tool_use":
+                self.messages.append({"role": "assistant", "content": reply.content})
+
+                tool_blocks = [b for b in reply.content if b.get("type") == "tool_use"]
+                if tool_blocks:
                     tool_results = []
-                    for block in response.content:
-                        if block.type != "tool_use":
-                            continue
-                        inp = block.input if isinstance(block.input, dict) else json.loads(block.input)
-                        text, is_err = self._run_tool(block.name, inp, emit, question)
-                        tr = {"type": "tool_result", "tool_use_id": block.id, "content": text}
+                    for block in tool_blocks:
+                        inp = block.get("input")
+                        if not isinstance(inp, dict):
+                            try:
+                                inp = json.loads(inp) if isinstance(inp, str) else {}
+                            except ValueError:
+                                inp = {}
+                        text, is_err = self._run_tool(block.get("name", ""), inp, emit, question)
+                        tr = {"type": "tool_result", "tool_use_id": block.get("id", ""), "content": text}
                         if is_err:
                             tr["is_error"] = True
                         tool_results.append(tr)
@@ -404,17 +409,19 @@ class Chat:
                         emit({"type": "text_break"})
                     continue
 
-                if response.stop_reason == "pause_turn":
+                if reply.stop_reason == "pause_turn":
                     continue
 
-                final_text = "".join(text_this_round) or "".join(b.text for b in response.content if b.type == "text")
-                if response.stop_reason == "refusal":
-                    det = getattr(response, "stop_details", None)
-                    why = f" ({det.category})" if det and getattr(det, "category", None) else ""
+                final_text = "".join(text_this_round) or "".join(b.get("text", "") for b in reply.content if b.get("type") == "text")
+                if reply.stop_reason == "refusal":
+                    why = f" ({reply.stop_details})" if reply.stop_details else ""
                     final_text = (final_text + f"\n\nThe model declined to answer this{why}.").strip()
                     emit({"type": "text_delta", "text": f"\n\nThe model declined to answer this{why}."})
-                elif response.stop_reason == "max_tokens":
+                elif reply.stop_reason == "max_tokens":
                     emit({"type": "text_delta", "text": "\n\n(answer cut off - ask me to continue)"})
+                if not final_text.strip():
+                    final_text = "The model returned an empty answer. Please ask again, perhaps with more detail."
+                    emit({"type": "text_delta", "text": final_text})
                 break
         except anthropic.AuthenticationError:
             return self._fail(emit, "The AI service key is invalid. An admin must update ANTHROPIC_API_KEY in .env.")
@@ -424,6 +431,8 @@ class Chat:
             return self._fail(emit, f"AI service error {e.status_code}. Try again in a moment.")
         except anthropic.APIConnectionError:
             return self._fail(emit, "Cannot reach the AI service. Check the internet connection.")
+        except RuntimeError as e:  # local model problems (Ollama down, model missing)
+            return self._fail(emit, str(e)[:300])
         finally:
             self.session_cost += q_cost
             self.turns += 1
@@ -431,8 +440,8 @@ class Chat:
                 record_usage({
                     "date": _dt.date.today().isoformat(),
                     "ts": _dt.datetime.now().isoformat(timespec="seconds"),
-                    "user": self.user, "role": self.role, "model": model,
-                    "cost": round(q_cost, 6), "rounds": rounds, **usage_tot,
+                    "user": self.user, "role": self.role, "model": model_name, "provider": provider.name,
+                    "cost": round(q_cost, 6), "rounds": rounds, "elapsed": round(time.time() - t0, 1), **usage_tot,
                     "question": question.strip()[:200],
                 })
             self._log_transcript(question, final_text, q_cost)
@@ -441,7 +450,7 @@ class Chat:
             "type": "final", "text": final_text, "cost": round(q_cost, 4),
             "session_cost": round(self.session_cost, 4), "spent_today": round(spent_today(), 4),
             "budget": s["daily_budget_usd"], "usage": usage_tot, "elapsed": round(time.time() - t0, 1),
-            "model": model, "turn": len(self.turn_log) - 1,
+            "model": model_name, "provider": provider.name, "turn": len(self.turn_log) - 1,
         })
         return final_text
 
@@ -510,6 +519,7 @@ class Chat:
         s = store.settings()
         return {
             "user": self.user, "role": self.role, "model": s["model"], "effort": s["effort"],
+            "provider": s.get("provider", "anthropic"), "model_label": model_label(s),
             "db": db.connection_summary(), "spent_today": round(spent_today(), 4),
             "my_spent_today": round(spent_today(self.user), 4),
             "budget": s["daily_budget_usd"], "my_budget": s["user_daily_budget_usd"],

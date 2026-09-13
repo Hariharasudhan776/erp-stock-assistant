@@ -163,7 +163,7 @@
     try {
       const st = await (await api('/api/status')).json();
       me = Object.assign(me || {}, st); renderUserCard();
-      $('#model').textContent = st.model.replace('claude-', '') + ' · ' + st.effort;
+      $('#model').textContent = st.model_label || (st.model.replace('claude-', '') + ' · ' + st.effort);
       $('#spent').textContent = money(st.my_spent_today) + ' / ' + money(st.spent_today);
       $('#budget').textContent = 'you $' + Number(st.my_budget).toFixed(2) + ' · all $' + Number(st.budget).toFixed(2) + ' per day';
       $('#bar').style.width = Math.min(100, 100 * st.spent_today / st.budget).toFixed(1) + '%';
@@ -264,7 +264,7 @@
       case 'final':
         ctx.working.hidden = true; ctx.turn = ev.turn;
         if (ev.text && ev.text.trim()) { ctx.text = ev.text; ctx.answer.hidden = false; ctx.amd.innerHTML = md(ev.text); }
-        ctx.foot.innerHTML = '<span><b>' + money(ev.cost) + '</b></span><span>' + ev.elapsed + 's</span>' + (me.show_sql && ctx.queries ? '<span>' + ctx.queries + (ctx.queries === 1 ? ' query' : ' queries') + '</span>' : '');
+        ctx.foot.innerHTML = '<span><b>' + (ev.provider === 'ollama' ? 'local · $0' : money(ev.cost)) + '</b></span><span>' + ev.elapsed + 's</span>' + (me.show_sql && ctx.queries ? '<span>' + ctx.queries + (ctx.queries === 1 ? ' query' : ' queries') + '</span>' : '');
         if (typeof ev.turn === 'number') ctx.foot.appendChild(feedbackBar(ctx));
         scrollDown(); break;
     }
@@ -354,7 +354,11 @@
       '<form id="adduser" class="form-inline five"><div class="field"><label>New username</label><input name="username" required minlength="3" autocomplete="off"></div><div class="field"><label>Password (min 8)</label><input name="password" type="password" required minlength="8" autocomplete="new-password"></div><div class="field"><label>ERP username (optional)</label><input name="erp_user" placeholder="ERP login id" autocomplete="off"></div><div class="field"><label>Role</label><select name="role"><option value="user">user</option><option value="admin">admin</option></select></div><button class="btn" type="submit">Add user</button></form><div class="form-err" id="usererr"></div>' +
       '<p class="desc" style="margin-top:10px">ERP sign-in is ' + (s.erp_login ? 'ON: anyone with an active ERP account can sign in with their ERP username and password; their modules come from their ERP groups.' : 'OFF: only the accounts above can sign in.') + ' Assistant admins by ERP username: <b>' + (erp.admin_users.length ? erp.admin_users.map(esc).join(', ') : 'none') + '</b>.</p>';
 
-    const modelsHtml = '<div class="models">' + c.models.map(m => '<div class="model ' + (m.model === s.model ? 'sel' : '') + '" data-model="' + m.model + '"><b>' + esc(m.label) + '</b><div class="note">' + esc(m.note) + '</div><div class="nums"><span>per question <b>' + money(m.per_question) + '</b></span><span>10/day <b>$' + m.monthly_10_per_day.toFixed(0) + '/mo</b></span><span>50/day <b>$' + m.monthly_50_per_day.toFixed(0) + '/mo</b></span></div></div>').join('') + '</div>' +
+    const ol = ov.ollama || { alive: false, models: [] };
+    const providerHtml = '<div class="settings-grid" style="margin-bottom:12px"><div class="field"><label>Answering model</label><select id="s-provider"><option value="anthropic" ' + (s.provider !== 'ollama' ? 'selected' : '') + '>Claude API (Anthropic)</option><option value="ollama" ' + (s.provider === 'ollama' ? 'selected' : '') + '>Local model via Ollama (nothing leaves this PC)</option></select></div>' +
+      '<div class="field"><label>Local model name</label><input id="s-omodel" value="' + esc(s.ollama_model || '') + '" placeholder="qwen3:8b"></div><div class="field"><label>Ollama URL</label><input id="s-ourl" value="' + esc(s.ollama_url || '') + '"></div></div>' +
+      '<p class="desc">' + (ol.alive ? 'Ollama is running at ' + esc(ol.url) + '. Downloaded models: <b>' + (ol.models.length ? ol.models.map(esc).join(', ') : 'none yet (run: ollama pull ' + esc(s.ollama_model || 'qwen3:8b') + ')') + '</b>. Local answers cost $0 and are slower on a PC without a GPU.' : 'Ollama is not running on this PC. Start it (or install from ollama.com) to use a local model.') + '</p>';
+    const modelsHtml = providerHtml + '<p class="desc" style="margin:0 0 6px"><b>Claude models</b> (used when the answering model is the Claude API):</p><div class="models">' + c.models.map(m => '<div class="model ' + (m.model === s.model ? 'sel' : '') + '" data-model="' + m.model + '"><b>' + esc(m.label) + '</b><div class="note">' + esc(m.note) + '</div><div class="nums"><span>per question <b>' + money(m.per_question) + '</b></span><span>10/day <b>$' + m.monthly_10_per_day.toFixed(0) + '/mo</b></span><span>50/day <b>$' + m.monthly_50_per_day.toFixed(0) + '/mo</b></span></div></div>').join('') + '</div>' +
       '<p class="desc">Estimates from the measured token profile of your last ' + c.profile.sample + ' questions (about ' + c.profile.cache_read.toLocaleString() + ' cached + ' + c.profile.uncached_input.toLocaleString() + ' fresh input tokens and ' + c.profile.output + ' output tokens per question).</p>' +
       '<div class="settings-grid">' +
       '<div class="field"><label>Effort</label><select id="s-effort">' + ov.efforts.map(e => '<option ' + (e === s.effort ? 'selected' : '') + '>' + e + '</option>').join('') + '</select></div>' +
@@ -401,7 +405,7 @@
       const msg = $('#settingsmsg'); msg.textContent = ''; msg.className = 'msg';
       const sel = $('#admin-content .model.sel'); const model = sel ? sel.dataset.model : s.model;
       try {
-        const r = await post('/api/admin/settings', { model, effort: $('#s-effort').value, daily_budget_usd: +$('#s-budget').value, user_daily_budget_usd: +$('#s-ubudget').value, max_rows: +$('#s-rows').value, model_rows: +$('#s-mrows').value, show_sql_to_users: $('#s-showsql').checked, erp_login: $('#s-erplogin').checked });
+        const r = await post('/api/admin/settings', { model, provider: $('#s-provider').value, ollama_model: $('#s-omodel').value, ollama_url: $('#s-ourl').value, effort: $('#s-effort').value, daily_budget_usd: +$('#s-budget').value, user_daily_budget_usd: +$('#s-ubudget').value, max_rows: +$('#s-rows').value, model_rows: +$('#s-mrows').value, show_sql_to_users: $('#s-showsql').checked, erp_login: $('#s-erplogin').checked });
         const j = await r.json(); if (!r.ok) throw new Error(j.error);
         msg.textContent = 'Saved'; refreshStatus(); ov.settings = j.settings;
       } catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }

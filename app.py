@@ -22,7 +22,8 @@ import auth
 import db
 import erp_roles
 import store
-from agent import Chat, cost_estimates, usage_summary
+from agent import Chat, cost_estimates, model_label, usage_summary
+import providers
 from config import CFG, ROOT
 
 try:
@@ -54,11 +55,11 @@ SECURITY_NOTES = [
     "Audit trail: sign-ins, failed sign-ins, questions, every SQL executed (with user and row count), denied queries, admin actions and knowledge changes are written to logs/audit.jsonl.",
     "Secrets: API key and DB credentials come from .env / OS environment, never from the repository; the schema notes and logs are git-ignored.",
     "Network: the server listens on 127.0.0.1 only; remote access goes through an HTTPS tunnel, and the same sign-in applies there.",
+    "Local model option: with the provider set to Ollama, the model runs on this machine and no question, schema note or query result leaves it. The browser page itself loads no external resources (scripts, styles and fonts are served by the app), so with the local provider the only network traffic is between the browser, this server and the Oracle database.",
 ]
 
-CSP = (
-    "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; "
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+CSP = (  # the page loads nothing from the internet: scripts, styles and fonts are all served by this app
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; "
     "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
 )
 
@@ -80,6 +81,13 @@ def _drop_chat(token: str | None) -> None:
 
 class _ClientGone(Exception):
     pass
+
+
+def _ollama_state() -> dict:
+    st = store.settings()
+    p = providers.OllamaProvider(st.get("ollama_url", "http://127.0.0.1:11434"), st.get("ollama_model", ""))
+    alive = p.alive()
+    return {"alive": alive, "url": p.url, "models": p.available_models() if alive else [], "selected": st.get("ollama_model")}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -231,6 +239,7 @@ class Handler(BaseHTTPRequestHandler):
                 "knowledge": store.notes(),
                 "feedback": store.recent_feedback(30),
                 "audit": store.recent_audit(40),
+                "ollama": _ollama_state(),
                 "erp": {
                     "admin_users": sorted(erp_roles.ADMIN_ERP_USERS),
                     "modules": [{"key": k, "label": m.get("label", k), "enabled": bool(m.get("tables")), "tables": len(m.get("tables", []))} for k, m in erp_roles.MODULES.items()],
@@ -242,6 +251,10 @@ class Handler(BaseHTTPRequestHandler):
                     "notes": SECURITY_NOTES,
                 },
             })
+        if u.path == "/api/admin/ollama":
+            if sess["role"] != "admin":
+                return self._json({"error": "admin only"}, 403)
+            return self._json(_ollama_state())
         if u.path == "/api/admin/groups":
             if sess["role"] != "admin":
                 return self._json({"error": "admin only"}, 403)
@@ -407,7 +420,10 @@ def main() -> None:
     httpd.daemon_threads = True
     url = f"http://127.0.0.1:{port}"
     s = store.settings()
-    print(f"Stock assistant  model={s['model']} effort={s['effort']}  ->  {url}   (Ctrl+C to stop)")
+    print(f"Stock assistant  answering with {model_label(s)}  ->  {url}   (Ctrl+C to stop)")
+    if s.get("provider") == "ollama":
+        st = _ollama_state()
+        print("Local model:", "Ollama running, models: " + ", ".join(st["models"]) if st["alive"] else "OLLAMA IS NOT RUNNING - start it or switch the provider in the admin panel")
     if "--no-browser" not in sys.argv:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:

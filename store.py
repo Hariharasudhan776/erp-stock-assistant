@@ -36,6 +36,9 @@ _DEFAULTS = {
     "max_rows": CFG.max_rows,     # rows kept for the grid / CSV
     "model_rows": 50,             # rows the model is allowed to read from a result (cost + speed)
     "erp_login": True,            # allow sign-in with ERP credentials
+    "provider": "anthropic",      # "anthropic" (Claude API) or "ollama" (local model, nothing leaves the PC)
+    "ollama_model": "qwen3:8b",
+    "ollama_url": "http://127.0.0.1:11434",
 }
 
 
@@ -90,6 +93,22 @@ def update_settings(patch: dict, by: str) -> dict:
     for key in ("show_sql_to_users", "erp_login"):
         if key in patch:
             cur[key] = bool(patch[key])
+    if "provider" in patch:
+        if patch["provider"] not in ("anthropic", "ollama"):
+            raise ValueError("provider must be anthropic or ollama.")
+        cur["provider"] = patch["provider"]
+    if "ollama_model" in patch:
+        import re as _re
+        v = str(patch["ollama_model"]).strip()
+        if not _re.fullmatch(r"[A-Za-z0-9_.:/-]{1,80}", v):
+            raise ValueError("Local model name: letters, digits, . : / _ - only.")
+        cur["ollama_model"] = v
+    if "ollama_url" in patch:
+        import re as _re
+        v = str(patch["ollama_url"]).strip().rstrip("/")
+        if not _re.fullmatch(r"https?://[A-Za-z0-9_.:-]+(?::\d+)?", v):
+            raise ValueError("Ollama URL must look like http://127.0.0.1:11434")
+        cur["ollama_url"] = v
     with _lock:
         _write_json(SETTINGS_FILE, cur)
     audit("settings_changed", by, changes=patch)

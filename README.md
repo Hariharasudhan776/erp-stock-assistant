@@ -154,6 +154,29 @@ Measured on the production schema with the schema notes cached (about 16.5k cach
 The admin panel recomputes this table from your own usage log. Daily budgets (global and per
 user) stop the AI service when reached.
 
+## Running fully local (no data leaves the machine)
+
+The answering model is a setting, not a dependency. Two providers ship:
+
+| provider | where the model runs | cost | what leaves the machine |
+|---|---|---|---|
+| `anthropic` | Anthropic's API | cents per question | the question, the schema notes and the query results, over TLS |
+| `ollama` | [Ollama](https://ollama.com) on this PC or a server you control | $0 | nothing |
+
+Switch in the admin panel (Model & cost card) or in `data/settings.json`. The browser page loads no
+external resources either: scripts, styles and fonts are served by the app, so with the local
+provider the only network traffic is browser, this server, and the Oracle database.
+
+Measured on an office PC with no GPU (Intel i5, 16 GB RAM, `qwen3:8b`): first answer about
+5 minutes, follow-ups about 90 seconds, and small-model mistakes on flags and joins. A 30B-class
+model on a 24 GB GPU is the realistic setup for daily use. Roles, allow-lists, learning and the
+audit log work identically with either provider, because they are enforced by the server, not by
+the model.
+
+```bash
+ollama pull qwen3:8b       # once; then pick "Local model via Ollama" in the admin panel
+```
+
 ## Public access
 
 The app has to run where it can reach the database, so "hosting" means a tunnel from that
