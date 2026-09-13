@@ -1,0 +1,11 @@
+# secrets and local state
+.env
+logs/
+__pycache__/
+*.pyc
+.claude/
+
+# private to this deployment: the ERP schema notes and the internal hand-over
+knowledge.py
+HANDOFF.md
+data/
