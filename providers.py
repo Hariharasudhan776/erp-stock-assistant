@@ -177,6 +177,20 @@ class OllamaProvider:
             content.append({"type": "tool_use", "id": f"call_{int(time.time() * 1000)}_{i}", "name": c["name"], "input": c["input"]})
         return Reply(content=content, stop_reason="tool_use" if calls else "end_turn", usage=usage, model=self.model)
 
+    def warm(self, system_blocks: list[dict], tools: list[dict]) -> None:
+        """Send the exact prefix (system + tools) once so Ollama caches its processed form."""
+        body = {
+            "model": self.model,
+            "messages": self._to_ollama(system_blocks, [{"role": "user", "content": "Reply with the single word OK."}]),
+            "tools": self._tools(tools),
+            "stream": False, "think": False, "keep_alive": "60m",
+            "options": {"num_ctx": self.num_ctx, "temperature": 0.1, "num_predict": 3},
+        }
+        req = urllib.request.Request(self.url + "/api/chat", data=json.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            r.read()
+
     def available_models(self) -> list[str]:
         try:
             with urllib.request.urlopen(self.url + "/api/tags", timeout=5) as r:

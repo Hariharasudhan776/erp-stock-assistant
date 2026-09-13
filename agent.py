@@ -25,9 +25,12 @@ import store
 from config import CFG, LOGS
 
 try:
-    from knowledge import SYSTEM_PROMPT  # your private schema notes (git-ignored)
+    import knowledge as _kn  # your private schema notes (git-ignored)
 except ImportError:  # fresh clone: start from the template and edit it
-    from knowledge_example import SYSTEM_PROMPT
+    import knowledge_example as _kn
+SYSTEM_PROMPT = _kn.SYSTEM_PROMPT
+SYSTEM_PROMPT_COMPACT = getattr(_kn, "SYSTEM_PROMPT_COMPACT", SYSTEM_PROMPT)  # small local models get the short briefing
+LOCAL_MODEL_ROWS = 25  # a local model reads at most this many result rows (prompt growth is what costs time)
 
 # ---------------------------------------------------------------- pricing --
 # USD per 1M tokens: (input, output). Cache write (1h) = 2x input, cache read = 0.1x input.
@@ -209,6 +212,33 @@ def current_provider(s: dict | None = None):
     return providers.AnthropicProvider(CFG.anthropic_api_key, s["model"], s["effort"])
 
 
+def system_blocks_for(provider_name: str, role: str, modules_info: list[dict]) -> list[dict]:
+    """The system prompt as blocks: full briefing (cached) for Claude, compact briefing for local models."""
+    learned = {"type": "text", "text": store.learned_prompt()}
+    if provider_name == "anthropic":
+        learned["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    base = SYSTEM_PROMPT if provider_name == "anthropic" else SYSTEM_PROMPT_COMPACT
+    return [{"type": "text", "text": base}, learned, {"type": "text", "text": policy.role_prompt(role, modules_info)}]
+
+
+def warm_local(s: dict | None = None) -> None:
+    """Pre-process the local model's prompt so the first real question does not pay for it (runs in a thread)."""
+    s = s or store.settings()
+    if s.get("provider") != "ollama":
+        return
+
+    def _run():
+        try:
+            p = current_provider(s)
+            t0 = time.time()
+            p.warm(system_blocks_for("ollama", "admin", []), TOOLS)
+            store.audit("local_warmup", None, model=p.model, seconds=round(time.time() - t0, 1))
+        except Exception as e:  # never break the app over a warm-up
+            store.audit("local_warmup_failed", None, error=str(e)[:200])
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def model_label(s: dict | None = None) -> str:
     s = s or store.settings()
     if s.get("provider") == "ollama":
@@ -237,10 +267,7 @@ class Chat:
 
     # -- request shaping -------------------------------------------------
     def _system_blocks(self, provider_name: str) -> list[dict]:
-        learned = {"type": "text", "text": store.learned_prompt()}
-        if provider_name == "anthropic":
-            learned["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-        return [{"type": "text", "text": SYSTEM_PROMPT}, learned, {"type": "text", "text": policy.role_prompt(self.role, self.modules_info)}]
+        return system_blocks_for(provider_name, self.role, self.modules_info)
 
     def _compact_history(self) -> None:
         last_q = None
@@ -291,7 +318,8 @@ class Chat:
                 self.results.append(res)
                 store.audit("sql_run", self.user, role=role, rows=res.rowcount, elapsed=round(res.elapsed, 2), sql=res.sql[:300])
                 emit({"type": "result", "index": len(self.results) - 1, **res.to_dict()})
-                return res.as_text(max_rows=s["model_rows"]), False
+                rows_for_model = min(s["model_rows"], LOCAL_MODEL_ROWS) if s.get("provider") == "ollama" else s["model_rows"]
+                return res.as_text(max_rows=rows_for_model), False
             if name in ("describe_table", "search_schema", "sample_rows") and role != "admin":
                 return policy.REFUSAL, True
             if name == "describe_table":

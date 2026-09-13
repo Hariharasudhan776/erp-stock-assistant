@@ -85,3 +85,7 @@ MODULES = {
     "purchasing": {"label": "Purchasing", "scope": "purchase orders, vendors, receipts against orders", "tables": ["PO_HDR", "PO_DTL", "VENDOR", "GRN_HDR", "GRN_DTL", "ITEM"]},
 }
 GROUP_MODULES = {"StoreKeeper": ["stock"], "Purchase": ["purchasing"]}  # ERP group -> modules (case-insensitive)
+
+
+# Compact briefing for small local models (keep it a fifth of SYSTEM_PROMPT or less).
+SYSTEM_PROMPT_COMPACT = SYSTEM_PROMPT

@@ -22,7 +22,7 @@ import auth
 import db
 import erp_roles
 import store
-from agent import Chat, cost_estimates, model_label, usage_summary
+from agent import Chat, cost_estimates, model_label, usage_summary, warm_local
 import providers
 from config import CFG, ROOT
 
@@ -391,7 +391,9 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json({"error": "mapping must be an object"}, 400)
                     return self._json({"ok": True, "overrides": store.save_group_overrides(mapping, by=user)})
                 if u.path == "/api/admin/settings":
-                    return self._json({"ok": True, "settings": store.update_settings(body, by=user)})
+                    new = store.update_settings(body, by=user)
+                    warm_local(new)  # switching to the local model: pre-process its prompt now, not on the first question
+                    return self._json({"ok": True, "settings": new})
                 if u.path == "/api/admin/knowledge":
                     if body.get("action") == "delete":
                         return self._json({"ok": store.delete_note(str(body.get("id", "")), by=user)})
@@ -424,6 +426,9 @@ def main() -> None:
     if s.get("provider") == "ollama":
         st = _ollama_state()
         print("Local model:", "Ollama running, models: " + ", ".join(st["models"]) if st["alive"] else "OLLAMA IS NOT RUNNING - start it or switch the provider in the admin panel")
+        if st["alive"]:
+            print("Warming the local model's prompt cache in the background (first answer will be faster)...")
+            warm_local(s)
     if "--no-browser" not in sys.argv:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
