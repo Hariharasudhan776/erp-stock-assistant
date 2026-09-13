@@ -3,14 +3,15 @@
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const money = v => '$' + Number(v).toFixed(Number(v) < 0.1 ? 4 : 2);
+  const money = v => '$' + Number(v || 0).toFixed(Number(v) < 0.1 ? 4 : 2);
   const md = s => {
     const html = window.marked ? marked.parse(s, { breaks: true, gfm: true }) : '<p>' + esc(s).replace(/\n/g, '<br>') + '</p>';
     return window.DOMPurify ? DOMPurify.sanitize(html, { USE_PROFILES: { html: true } }) : esc(s);
   };
   function toast(t, ms = 2600) { const el = $('#toast'); el.textContent = t; el.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => el.classList.remove('show'), ms); }
+  const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
 
-  /* ---------- api with sign-in handling ---------- */
+  /* ---------- api ---------- */
   let me = null;
   async function api(path, opts = {}) {
     const headers = Object.assign({ 'X-Requested-With': 'fetch' }, opts.headers || {});
@@ -22,16 +23,15 @@
 
   /* ---------- theme ---------- */
   const root = document.documentElement;
-  function applyTheme(t) { root.setAttribute('data-theme', t); $('#themelabel').textContent = t === 'dark' ? 'Light' : 'Dark'; try { localStorage.setItem('theme', t); } catch (e) {} }
-  let savedTheme = null; try { savedTheme = localStorage.getItem('theme'); } catch (e) {}
-  applyTheme(savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
-  $('#theme').onclick = () => applyTheme(root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+  let theme = store.get('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  function applyTheme(t) { theme = t; root.setAttribute('data-theme', t); store.set('theme', t); }
+  applyTheme(theme);
 
-  /* ---------- branding (public endpoint, private values) ---------- */
-  let brand = { name: 'Stock Assistant', subtitle: '', library: [] };
+  /* ---------- branding ---------- */
+  let brand = { name: 'ERP Insight', subtitle: '', library: [] };
   async function loadBranding() {
     try { const j = await (await fetch('/api/branding')).json(); brand = Object.assign(brand, j.brand || {}, { library: j.library || [] }); } catch (e) {}
-    document.title = brand.name; $$('.brandname').forEach(el => el.textContent = brand.name); $('#brandsub').textContent = brand.subtitle || '';
+    document.title = brand.name; $$('.brandname').forEach(el => el.textContent = brand.name); $('#brandsub').textContent = brand.subtitle || 'read-only';
   }
 
   /* ---------- login ---------- */
@@ -39,7 +39,7 @@
   function showLogin(msg) { appEl.hidden = true; loginEl.hidden = false; $('#loginerr').textContent = msg || ''; setTimeout(() => $('#lu').focus(), 50); }
   $('#loginform').onsubmit = async e => {
     e.preventDefault();
-    const btn = $('#loginbtn'); btn.disabled = true; $('#loginerr').textContent = '';
+    const btn = $('#loginbtn'); btn.disabled = true; $('#loginerr').textContent = ''; btn.textContent = 'Signing in…';
     try {
       const r = await post('/api/login', { username: $('#lu').value.trim(), password: $('#lp').value });
       const j = await r.json();
@@ -47,9 +47,34 @@
       $('#lp').value = '';
       await boot();
     } catch (err) { $('#loginerr').textContent = 'Server not reachable.'; }
-    finally { btn.disabled = false; }
+    finally { btn.disabled = false; btn.textContent = 'Sign in'; }
   };
-  $('#logout').onclick = async () => { try { await post('/api/logout'); } catch (e) {} location.reload(); };
+
+  /* ---------- views ---------- */
+  const thread = $('#thread'), inner = $('#inner'), hero = $('#hero'), q = $('#q'), send = $('#send');
+  const views = { chat: $('#chatview'), profile: $('#profile'), admin: $('#admin') };
+  let view = 'chat';
+  function showView(v) {
+    view = v; Object.entries(views).forEach(([k, el]) => el.hidden = k !== v);
+    if (v === 'profile') renderProfile();
+    if (v === 'admin') loadAdmin();
+    if (v === 'chat') setTimeout(() => q.focus(), 30);
+    closeSide();
+  }
+  $('#mebtn').onclick = () => showView('profile');
+  $('#backchat1').onclick = () => showView('chat');
+  $('#backchat2').onclick = () => showView('chat');
+  $('#backprofile').onclick = () => showView('profile');
+  $('#adminbtn').onclick = () => showView('admin');
+  const nearBottom = () => thread.scrollHeight - thread.scrollTop - thread.clientHeight < 140;
+  function scrollDown(force) { if (force || scrollDown.stick) thread.scrollTop = thread.scrollHeight; }
+  scrollDown.stick = true;
+  thread.addEventListener('scroll', () => { scrollDown.stick = nearBottom(); $('#scrolldown').classList.toggle('show', !scrollDown.stick); });
+  $('#scrolldown').onclick = () => { scrollDown.stick = true; scrollDown(true); };
+  const side = $('#side'), scrim = $('#scrim');
+  function closeSide() { side.classList.remove('open'); scrim.classList.remove('show'); }
+  $('#menu').onclick = () => { side.classList.add('open'); scrim.classList.add('show'); };
+  scrim.onclick = closeSide;
 
   /* ---------- boot ---------- */
   async function boot() {
@@ -57,70 +82,106 @@
     if (r.status === 401) { const j = await r.json().catch(() => ({})); showLogin(j.users_exist === false ? 'No users yet. Create the first admin with: python manage.py create <name> admin' : ''); return; }
     me = await r.json();
     loginEl.hidden = true; appEl.hidden = false;
-    renderUserCard();
-    $('#adminbtn').hidden = me.role !== 'admin';
-    $('#sqltoggle').hidden = !me.show_sql;
-    applySqlPref();
+    renderMe(); applySqlPref();
     const h = new Date().getHours();
-    $('#greet').innerHTML = (h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening') + ', ' + esc(me.user) + '. What do you want to know about <span>stock</span>?';
-    if (!$('#lib').dataset.built) buildLibrary();
+    $('#greet').innerHTML = (h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening') + ', ' + esc(me.user) + '.<br>What do you want to know <span class="grad">today</span>?';
+    buildLibrary();
     showView('chat');
-    inner.querySelectorAll('.turn').forEach(t => t.remove()); recents.length = 0; renderRecents();
-    await Promise.all([refreshStatus(), loadHistory()]);
-    q.focus();
+    await refreshConvs(true);
+    refreshStatus();
   }
-  function renderUserCard() {
+  function renderMe() {
     $('#uname').textContent = me.user; $('#uav').textContent = me.user.slice(0, 2).toUpperCase();
-    const badge = $('#urole'); badge.textContent = me.role; badge.className = 'badge ' + (me.role === 'admin' ? '' : 'user');
-    const mods = $('#umods'); mods.innerHTML = '';
-    (me.modules || []).forEach(m => { const b = document.createElement('span'); b.className = 'badge mod'; b.textContent = m; mods.appendChild(b); });
-    if (me.role !== 'admin' && !(me.modules || []).length) { const b = document.createElement('span'); b.className = 'badge mod'; b.textContent = 'no modules yet'; mods.appendChild(b); }
+    $('#urolesub').textContent = me.role === 'admin' ? 'Administrator · all modules' : ((me.modules || []).join(', ') || 'no modules yet');
+    $('#adminbtn').hidden = me.role !== 'admin';
+    const pill = $('#modelpill'); pill.textContent = me.model_label || me.model || ''; pill.classList.toggle('local', me.provider === 'ollama');
+    $('#heroline').textContent = me.provider === 'ollama' ? 'Local model · nothing leaves this PC' : 'Connected to the live ERP · read-only';
   }
 
   /* ---------- SQL visibility ---------- */
-  let showSql = false; try { showSql = localStorage.getItem('showSql') === '1'; } catch (e) {}
-  function applySqlPref() {
-    const on = me && me.show_sql && showSql;
-    document.body.classList.toggle('hide-sql', !on);
-    $('#sqltoggle').classList.toggle('on', on);
-    $('#sqllabel').textContent = on ? 'Queries shown' : 'Queries hidden';
-  }
-  $('#sqltoggle').onclick = () => { showSql = !showSql; try { localStorage.setItem('showSql', showSql ? '1' : '0'); } catch (e) {} applySqlPref(); };
+  let showSql = store.get('showSql') === '1';
+  function applySqlPref() { const on = !!(me && me.show_sql && showSql); document.body.classList.toggle('hide-sql', !on); }
 
-  /* ---------- question library ---------- */
+  /* ---------- question library (chat empty state) ---------- */
   const ICON = {
     box: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3 21 7.5v9L12 21l-9-4.5v-9L12 3Z"/><path d="M3 7.5l9 4.5 9-4.5M12 12v9"/></svg>',
     move: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6 4 4 6-8"/><path d="M14 7h6v6"/></svg>',
     truck: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 7h11v9H3zM14 10h4l3 3v3h-7z"/><circle cx="7" cy="18" r="1.6"/><circle cx="17" cy="18" r="1.6"/></svg>',
     warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2.5 20h19L12 3Z"/><path d="M12 10v4M12 17.5v.5"/></svg>',
-    site: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 21h18M5 21V8l7-4 7 4v13M9 21v-6h6v6"/></svg>'
+    site: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 21h18M5 21V8l7-4 7 4v13M9 21v-6h6v6"/></svg>',
+    money: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M14.5 9.5c-.5-1-1.5-1.5-2.5-1.5-1.7 0-3 .9-3 2s1.3 2 3 2 3 .9 3 2-1.3 2-3 2c-1 0-2-.5-2.5-1.5M12 6v2M12 16v2"/></svg>'
   };
-  const LIB = () => brand.library.map(g => ({ title: g.title, icon: ICON[g.icon] ? g.icon : 'box', qs: g.questions || [] }));
-  const STARTERS = () => LIB().slice(0, 4).filter(g => g.qs.length).map(g => [g.icon, g.title, g.qs[0]]);
+  let libBuilt = false;
   function buildLibrary() {
-    const lib = $('#lib'); lib.dataset.built = '1';
-    LIB().forEach((g, i) => {
-      const d = document.createElement('details'); if (i === 0) d.open = true;
-      d.innerHTML = '<summary><span class="ico">' + ICON[g.icon] + '</span>' + esc(g.title) + '<svg class="chev" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></summary><div class="qs"></div>';
-      const box = $('.qs', d);
-      g.qs.forEach(t => { const b = document.createElement('button'); b.className = 'q-item'; b.textContent = t; b.onclick = () => { q.value = t; closeSide(); showView('chat'); ask(); }; box.appendChild(b); });
-      lib.appendChild(d);
-    });
-    STARTERS().forEach(([ic, title, text]) => {
-      const b = document.createElement('button'); b.className = 'starter';
-      b.innerHTML = '<span class="ico">' + ICON[ic] + '</span><div><b>' + esc(title) + '</b><span>' + esc(text) + '</span></div>';
-      b.onclick = () => { q.value = text; ask(); }; $('#starters').appendChild(b);
-    });
+    if (libBuilt) return; libBuilt = true;
+    const groups = brand.library.filter(g => (g.questions || []).length);
+    const cats = $('#cats'), chips = $('#chips');
+    if (!groups.length) { cats.hidden = true; return; }
+    function pick(i) {
+      $$('.cat', cats).forEach((c, j) => c.classList.toggle('sel', j === i));
+      chips.innerHTML = '';
+      groups[i].questions.forEach(t => { const b = document.createElement('button'); b.className = 'chip'; b.textContent = t; b.onclick = () => { q.value = t; ask(); }; chips.appendChild(b); });
+    }
+    groups.forEach((g, i) => { const b = document.createElement('button'); b.className = 'cat'; b.innerHTML = (ICON[g.icon] || ICON.box) + '<span></span>'; $('span', b).textContent = g.title; b.onclick = () => pick(i); cats.appendChild(b); });
+    pick(0);
   }
 
-  /* ---------- recents ---------- */
-  const recents = [];
-  function renderRecents() {
-    const box = $('#recent'); box.innerHTML = '<h3>Recent</h3>';
-    if (!recents.length) { box.innerHTML += '<div class="empty-note">Your questions will appear here.</div>'; return; }
-    recents.forEach(r => { const b = document.createElement('button'); b.className = 'q-item'; b.textContent = r; b.title = r; b.onclick = () => { q.value = r; autosize(); closeSide(); showView('chat'); q.focus(); }; box.appendChild(b); });
+  /* ---------- conversations ---------- */
+  let convs = [], activeConv = null;
+  async function refreshConvs(loadActive) {
+    try {
+      const j = await (await api('/api/conversations')).json();
+      convs = j.conversations || []; const prev = activeConv; activeConv = j.active;
+      renderConvs();
+      if (loadActive || prev !== activeConv) await loadHistory(activeConv);
+    } catch (e) {}
   }
-  function addRecent(t) { const i = recents.indexOf(t); if (i >= 0) recents.splice(i, 1); recents.unshift(t); recents.splice(10); renderRecents(); }
+  function renderConvs() {
+    const box = $('#convs'); box.innerHTML = '';
+    const real = convs.filter(c => c.turns > 0 || c.active);
+    if (!real.length) { box.innerHTML = '<div class="empty-note">Your conversations appear here.</div>'; return; }
+    real.forEach(c => {
+      const b = document.createElement('button'); b.className = 'conv' + (c.active ? ' active' : ''); b.title = c.title;
+      b.innerHTML = '<span class="ico"></span><span class="t"></span><span class="m"></span><button class="del" title="Delete conversation">×</button>';
+      $('.t', b).textContent = c.title; $('.m', b).textContent = c.turns ? c.turns + (c.turns === 1 ? ' q' : ' q') : c.started;
+      b.onclick = e => { if (e.target.closest('.del')) return; switchConv(c.id); };
+      $('.del', b).onclick = async e => { e.stopPropagation(); if (busy) { toast('Wait for the current answer first.'); return; } if (c.turns && !confirm('Delete this conversation?')) return; try { const j = await (await post('/api/conversations', { action: 'delete', id: c.id })).json(); convs = j.conversations; activeConv = j.active; renderConvs(); await loadHistory(activeConv); } catch (err) { toast('Failed'); } };
+      box.appendChild(b);
+    });
+  }
+  async function switchConv(id) {
+    if (busy) { toast('Wait for the current answer or press Esc to stop it.'); return; }
+    if (id === activeConv) { showView('chat'); return; }
+    try { const j = await (await post('/api/conversations', { action: 'switch', id })).json(); convs = j.conversations; activeConv = j.active; renderConvs(); await loadHistory(activeConv); showView('chat'); refreshStatus(); } catch (e) { toast('Failed'); }
+  }
+  $('#newchat').onclick = async () => {
+    if (busy) { toast('Wait for the current answer or press Esc to stop it.'); return; }
+    try { const j = await (await post('/api/conversations', { action: 'new' })).json(); convs = j.conversations; activeConv = j.active; renderConvs(); await loadHistory(activeConv); } catch (e) { return; }
+    showView('chat'); refreshStatus();
+  };
+  async function loadHistory(cid) {
+    inner.querySelectorAll('.turn').forEach(t => t.remove()); hero.hidden = false;
+    try {
+      const h = await (await api('/api/history?c=' + encodeURIComponent(cid || ''))).json();
+      (h.turns || []).forEach(t => { const ctx = newTurn(t.q); t.events.forEach(ev => handle(ctx, ev)); finish(ctx); });
+      if ((h.turns || []).length) scrollDown(true);
+    } catch (e) {}
+  }
+
+  /* ---------- status ---------- */
+  let st = null, dbState = null;
+  async function refreshStatus() {
+    try {
+      st = await (await api('/api/status')).json(); me = Object.assign(me || {}, st); renderMe(); applySqlPref();
+      $('#sesscost').textContent = st.session_cost ? money(st.session_cost) + ' this conversation' : '';
+      if (view === 'profile') renderProfile();
+    } catch (e) {}
+  }
+  async function checkDb() {
+    try { const d = await (await api('/api/dbcheck')).json(); dbState = d.ok ? { ok: true, text: d.db } : { ok: false, text: 'DB error: ' + d.error }; }
+    catch (e) { dbState = { ok: false, text: 'Server not reachable' }; }
+    if (view === 'profile') renderProfile(false);
+  }
 
   /* ---------- helpers ---------- */
   const NUMRE = /^-?\d+(?:\.\d+)?$/;
@@ -135,47 +196,13 @@
     return out + esc(sql.slice(last));
   }
   async function copyText(t, btn) { try { await navigator.clipboard.writeText(t); const o = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => btn.textContent = o, 1200); } catch (e) { toast('Copy failed'); } }
-  async function downloadCsv(i) {
+  async function downloadCsv(i, cid) {
     try {
-      const r = await api('/api/csv?i=' + i); if (!r.ok) throw new Error(r.statusText);
+      const r = await api('/api/csv?i=' + i + '&c=' + encodeURIComponent(cid || '')); if (!r.ok) throw new Error(r.statusText);
       const url = URL.createObjectURL(await r.blob()); const a = document.createElement('a'); a.href = url; a.download = 'result-' + (i + 1) + '.csv'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 3000);
     } catch (e) { toast('Download failed: ' + e.message); }
   }
-
-  /* ---------- views ---------- */
-  const thread = $('#thread'), inner = $('#inner'), hero = $('#hero'), q = $('#q'), send = $('#send'), adminEl = $('#admin');
-  function showView(v) {
-    const chat = v === 'chat';
-    thread.hidden = !chat; $('.composer-wrap').hidden = !chat; adminEl.hidden = chat;
-    $('#adminbtn').classList.toggle('on', !chat);
-    if (!chat) loadAdmin();
-  }
-  $('#adminbtn').onclick = () => { closeSide(); showView(adminEl.hidden ? 'admin' : 'chat'); };
-  $('#backchat').onclick = () => showView('chat');
-  const nearBottom = () => thread.scrollHeight - thread.scrollTop - thread.clientHeight < 140;
-  function scrollDown(force) { if (force || scrollDown.stick) thread.scrollTop = thread.scrollHeight; }
-  scrollDown.stick = true;
-  thread.addEventListener('scroll', () => { scrollDown.stick = nearBottom(); $('#scrolldown').classList.toggle('show', !scrollDown.stick); });
-  $('#scrolldown').onclick = () => { scrollDown.stick = true; scrollDown(true); };
-
-  /* ---------- status ---------- */
-  async function refreshStatus() {
-    try {
-      const st = await (await api('/api/status')).json();
-      me = Object.assign(me || {}, st); renderUserCard();
-      $('#model').textContent = st.model_label || (st.model.replace('claude-', '') + ' · ' + st.effort);
-      $('#spent').textContent = money(st.my_spent_today) + ' / ' + money(st.spent_today);
-      $('#budget').textContent = 'you $' + Number(st.my_budget).toFixed(2) + ' · all $' + Number(st.budget).toFixed(2) + ' per day';
-      $('#bar').style.width = Math.min(100, 100 * st.spent_today / st.budget).toFixed(1) + '%';
-      $('#sesscost').textContent = st.session_cost ? money(st.session_cost) + ' this conversation' : '';
-      $('#sqltoggle').hidden = !st.show_sql; applySqlPref();
-    } catch (e) { $('#dbtext').textContent = 'Server not reachable'; $('#dbdot').className = 'dot bad'; return; }
-    try {
-      const d = await (await api('/api/dbcheck')).json();
-      if (d.ok) { $('#dbtext').textContent = d.db; $('#dbdot').className = 'dot ok'; }
-      else { $('#dbtext').textContent = 'DB error: ' + d.error; $('#dbdot').className = 'dot bad'; }
-    } catch (e) {}
-  }
+  const fmtSecs = s => s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's';
 
   /* ---------- rendering a turn ---------- */
   const SVG_BOT = '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round"><path d="M12 2.5 21 7v10l-9 4.5L3 17V7l9-4.5Z"/><path d="M3 7l9 4.5L21 7M12 11.5V21.5"/></svg>';
@@ -187,14 +214,16 @@
   function newTurn(question) {
     hero.hidden = true;
     const t = document.createElement('div'); t.className = 'turn';
-    t.innerHTML = '<div class="u-row"><div class="u-bubble"></div></div><div class="a-row"><div class="avatar">' + SVG_BOT + '</div><div class="a-body"><div class="steps"></div><div class="working"><span class="spin"></span><span class="wtxt">Thinking…</span></div><div class="answer" hidden><button class="acopy">Copy</button><div class="amd"></div></div><div class="a-foot"></div></div></div>';
+    t.innerHTML = '<div class="u-row"><div class="u-bubble"></div></div><div class="a-row"><div class="avatar">' + SVG_BOT + '</div><div class="a-body"><div class="steps"></div><div class="working"><span class="orb"></span><span class="wtxt">Thinking…</span><span class="timer"></span></div><div class="answer" hidden><button class="acopy">Copy</button><div class="amd"></div></div><div class="a-foot"></div></div></div>';
     $('.u-bubble', t).textContent = question;
     inner.appendChild(t);
-    const ctx = { el: t, body: $('.a-body', t), steps: $('.steps', t), working: $('.working', t), wtxt: $('.wtxt', t), answer: $('.answer', t), amd: $('.amd', t), foot: $('.a-foot', t), text: '', lastStep: null, turn: null, queries: 0 };
+    const ctx = { el: t, body: $('.a-body', t), steps: $('.steps', t), working: $('.working', t), wtxt: $('.wtxt', t), timer: $('.timer', t), answer: $('.answer', t), amd: $('.amd', t), foot: $('.a-foot', t), text: '', lastStep: null, turn: null, queries: 0, conv: activeConv, t0: Date.now(), tick: null };
     $('.acopy', t).onclick = e => copyText(ctx.text, e.currentTarget);
     scrollDown(true);
     return ctx;
   }
+  function startTimer(ctx) { ctx.tick = setInterval(() => { ctx.timer.textContent = fmtSecs(Math.round((Date.now() - ctx.t0) / 1000)); }, 1000); }
+  function finish(ctx) { ctx.working.hidden = true; if (ctx.tick) { clearInterval(ctx.tick); ctx.tick = null; } }
   function addStep(ctx, ev) {
     ctx.queries++;
     const d = document.createElement('details'); d.className = 'step';
@@ -210,7 +239,7 @@
     function draw() {
       g.innerHTML = '<table><thead><tr>' + cols.map((c, i) => '<th class="' + (numCols[i] ? 'num' : '') + '" data-i="' + i + '">' + esc(c) + (sortCol === i ? '<span class="arr">' + (sortDir > 0 ? '▲' : '▼') + '</span>' : '') + '</th>').join('') + '</tr></thead><tbody>' +
         rows.map(r => '<tr>' + r.map((v, i) => '<td class="' + (numCols[i] ? 'num' : '') + '" title="' + esc(v) + '">' + fmtCell(v, cols[i]) + '</td>').join('') + '</tr>').join('') + '</tbody></table>';
-      $$('th', g).forEach(th => th.onclick = () => { const i = +th.dataset.i; sortDir = sortCol === i ? -sortDir : 1; sortCol = i; rows.sort((a, b) => numCols[i] ? (Number(a[i] || 0) - Number(b[i] || 0)) * sortDir : a[i].localeCompare(b[i], undefined, { numeric: true }) * sortDir); draw(); });
+      $$('th', g).forEach(th => th.onclick = () => { const i = +th.dataset.i; sortDir = sortCol === i ? -sortDir : 1; sortCol = i; rows.sort((a, b) => numCols[i] ? (Number(a[i] || 0) - Number(b[i] || 0)) * sortDir : String(a[i]).localeCompare(String(b[i]), undefined, { numeric: true }) * sortDir); draw(); });
     }
     draw(); host.appendChild(g);
   }
@@ -222,7 +251,7 @@
     const t = document.createElement('div'); t.className = 'tools';
     t.innerHTML = (ev.rowcount ? '<a class="dl" href="#" data-i="' + ev.index + '">' + SVG_DL + 'Download CSV</a>' : '<span>No rows returned</span>') + (ev.truncated ? '<span>Showing the first ' + ev.rowcount + ' rows (cap)</span>' : '') + '<span>Click a column header to sort</span>';
     inner2.appendChild(t);
-    const dl = $('.dl', t); if (dl) dl.onclick = e => { e.preventDefault(); downloadCsv(+dl.dataset.i); };
+    const dl = $('.dl', t); if (dl) dl.onclick = e => { e.preventDefault(); downloadCsv(+dl.dataset.i, ctx.conv); };
     if (!ev.rowcount) d.open = true;
   }
   function markError(ctx, text) { const d = ctx.lastStep; if (!d) return; d.classList.add('err'); $('.mtext', d).textContent = 'error, retrying'; const p = document.createElement('div'); p.className = 'errtext'; p.textContent = text; $('.inner', d).appendChild(p); }
@@ -243,7 +272,7 @@
   }
   async function sendFeedback(ctx, vote, text, selBtn, otherBtn) {
     try {
-      const r = await post('/api/feedback', { turn: ctx.turn, vote, text }); const j = await r.json();
+      const r = await post('/api/feedback', { turn: ctx.turn, vote, text, conversation: ctx.conv }); const j = await r.json();
       if (!r.ok) throw new Error(j.error || 'failed');
       selBtn.classList.add('sel'); otherBtn.classList.remove('sel');
       if (j.learned) showLearned(ctx, j.learned); else toast(vote === 'up' ? 'Thanks for the feedback' : 'Feedback recorded for the admin');
@@ -253,18 +282,19 @@
 
   function handle(ctx, ev) {
     switch (ev.type) {
+      case 'ping': if (typeof ev.elapsed === 'number') ctx.timer.textContent = fmtSecs(ev.elapsed); break;
       case 'status': ctx.wtxt.textContent = ev.text === 'thinking' ? 'Thinking…' : 'Reading the results…'; break;
-      case 'tool': addStep(ctx, ev); ctx.wtxt.textContent = me.show_sql && ev.purpose ? 'Running: ' + ev.purpose : 'Checking the ledger…'; break;
+      case 'tool': addStep(ctx, ev); ctx.wtxt.textContent = me.show_sql && ev.purpose ? 'Running: ' + ev.purpose : 'Checking the ERP…'; break;
       case 'result': fillResult(ctx, ev); break;
       case 'sql_error': markError(ctx, ev.text); break;
       case 'learned': showLearned(ctx, ev); break;
       case 'text_delta': ctx.text += ev.text; ctx.answer.hidden = false; ctx.amd.innerHTML = md(ctx.text); scrollDown(); break;
       case 'text_break': ctx.text += '\n\n'; break;
-      case 'error': ctx.working.hidden = true; { const er = document.createElement('div'); er.className = 'errcard'; er.textContent = ev.text; ctx.body.insertBefore(er, ctx.foot); } break;
+      case 'error': finish(ctx); { const er = document.createElement('div'); er.className = 'errcard'; er.textContent = ev.text; ctx.body.insertBefore(er, ctx.foot); } break;
       case 'final':
-        ctx.working.hidden = true; ctx.turn = ev.turn;
+        finish(ctx); ctx.turn = ev.turn;
         if (ev.text && ev.text.trim()) { ctx.text = ev.text; ctx.answer.hidden = false; ctx.amd.innerHTML = md(ev.text); }
-        ctx.foot.innerHTML = '<span><b>' + (ev.provider === 'ollama' ? 'local · $0' : money(ev.cost)) + '</b></span><span>' + ev.elapsed + 's</span>' + (me.show_sql && ctx.queries ? '<span>' + ctx.queries + (ctx.queries === 1 ? ' query' : ' queries') + '</span>' : '');
+        ctx.foot.innerHTML = '<span><b>' + (ev.provider === 'ollama' ? 'local · $0' : money(ev.cost)) + '</b></span><span>' + fmtSecs(Math.round(ev.elapsed)) + '</span>' + (me.show_sql && ctx.queries ? '<span>' + ctx.queries + (ctx.queries === 1 ? ' query' : ' queries') + '</span>' : '');
         if (typeof ev.turn === 'number') ctx.foot.appendChild(feedbackBar(ctx));
         scrollDown(); break;
     }
@@ -277,10 +307,12 @@
   function stop() { if (busy && aborter) aborter.abort(); }
   async function ask() {
     const text = q.value.trim(); if (!text || busy) return;
-    q.value = ''; autosize(); setBusy(true); addRecent(text); scrollDown.stick = true;
-    const ctx = newTurn(text); aborter = new AbortController();
+    if (view !== 'chat') showView('chat');
+    q.value = ''; autosize(); setBusy(true); scrollDown.stick = true;
+    const ctx = newTurn(text); startTimer(ctx); aborter = new AbortController();
+    const firstTurn = !inner.querySelectorAll('.turn')[1];
     try {
-      const res = await post('/api/chat', { message: text }, { signal: aborter.signal });
+      const res = await post('/api/chat', { message: text, conversation: activeConv }, { signal: aborter.signal });
       if (!res.ok || !res.body) { let t = ''; try { t = (await res.json()).error; } catch (e) { t = res.statusText; } throw new Error(t || 'request failed'); }
       const reader = res.body.getReader(), dec = new TextDecoder(); let buf = '';
       while (true) {
@@ -288,42 +320,59 @@
         buf += dec.decode(value, { stream: true });
         let i; while ((i = buf.indexOf('\n\n')) >= 0) { const chunk = buf.slice(0, i); buf = buf.slice(i + 2); if (chunk.startsWith('data: ')) { try { handle(ctx, JSON.parse(chunk.slice(6))); } catch (e) { console.error(e); } } }
       }
-      if (!ctx.working.hidden) { ctx.working.hidden = true; if (!ctx.text) handle(ctx, { type: 'error', text: 'The connection closed before an answer arrived.' }); }
+      if (!ctx.working.hidden) { finish(ctx); if (!ctx.text) handle(ctx, { type: 'error', text: 'The connection closed before an answer arrived. Please ask again.' }); }
     } catch (e) {
-      ctx.working.hidden = true;
+      finish(ctx);
       if (e.name === 'AbortError') { const s = document.createElement('div'); s.className = 'stopped'; s.textContent = 'Stopped. This question was discarded from the conversation.'; ctx.body.insertBefore(s, ctx.foot); }
       else if (e.message !== 'signed out') handle(ctx, { type: 'error', text: 'Request failed: ' + e.message });
-    } finally { setBusy(false); aborter = null; q.focus(); refreshStatus(); }
-  }
-  async function loadHistory() {
-    try {
-      const h = await (await api('/api/history')).json();
-      (h.turns || []).forEach(t => { const ctx = newTurn(t.q); addRecent(t.q); t.events.forEach(ev => handle(ctx, ev)); ctx.working.hidden = true; });
-      if ((h.turns || []).length) scrollDown(true);
-    } catch (e) {}
+    } finally { setBusy(false); aborter = null; q.focus(); refreshStatus(); if (firstTurn) refreshConvs(false); else renderConvs(); }
   }
 
   /* ---------- composer wiring ---------- */
   function autosize() { q.style.height = 'auto'; q.style.height = Math.min(200, q.scrollHeight) + 'px'; }
   q.addEventListener('input', autosize);
   q.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } if (e.key === 'Escape') stop(); });
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') stop(); if (e.key === '/' && document.activeElement !== q && !appEl.hidden && adminEl.hidden) { e.preventDefault(); q.focus(); } });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') stop(); if (e.key === '/' && document.activeElement !== q && !appEl.hidden && view === 'chat') { e.preventDefault(); q.focus(); } });
   send.onclick = () => busy ? stop() : ask();
-  $('#newchat').onclick = async () => {
-    if (busy) { toast('Wait for the current answer or press Esc to stop it.'); return; }
-    try { await post('/api/reset'); } catch (e) { return; }
-    inner.querySelectorAll('.turn').forEach(t => t.remove()); hero.hidden = false; showView('chat'); refreshStatus(); closeSide(); q.focus();
-  };
-  const side = $('#side'), scrim = $('#scrim');
-  function closeSide() { side.classList.remove('open'); scrim.classList.remove('show'); }
-  $('#menu').onclick = () => { side.classList.add('open'); scrim.classList.add('show'); };
-  scrim.onclick = closeSide;
+
+  /* ---------- profile page ---------- */
+  function renderProfile(fetchDb = true) {
+    if (!me) return;
+    const s = st || me;
+    const isErpLogin = !!(me.erp_user && me.user === String(me.erp_user).toLowerCase());
+    const mods = me.role === 'admin' ? ['all modules'] : (me.modules || []);
+    const spentPct = s.budget ? Math.min(100, 100 * s.spent_today / s.budget) : 0;
+    const myPct = s.my_budget ? Math.min(100, 100 * s.my_spent_today / s.my_budget) : 0;
+    const db = dbState || { ok: null, text: 'Checking…' };
+    $('#profile-content').innerHTML =
+      '<div class="identity"><div class="av big">' + esc(me.user.slice(0, 2).toUpperCase()) + '</div><div class="who"><h2>' + esc(me.user) + '</h2><div class="sub"><span class="badge ' + (me.role === 'admin' ? '' : 'user') + '">' + esc(me.role) + '</span> &nbsp; ' + (me.erp_user ? 'ERP account <b>' + esc(me.erp_user) + '</b>' : 'app account') + (isErpLogin ? ' · signed in with ERP credentials' : '') + '</div></div></div>' +
+      '<div class="pcards">' +
+      '<section class="acard"><h3>Access</h3><p class="desc">' + (me.role === 'admin' ? 'Administrator: every module, learning mode on.' : 'Modules you can ask about. Anything else gets the privileges message.') + '</p><div class="mods">' + (mods.length ? mods.map(m => '<span class="badge mod">' + esc(m) + '</span>').join('') : '<span class="badge mod">no modules yet</span>') + '</div>' +
+        ((me.groups || []).length ? '<p class="desc" style="margin:12px 0 6px">Your ERP groups</p><div class="mods">' + me.groups.map(g => '<span class="badge mod">' + esc(g) + '</span>').join('') + '</div>' : '') + '</section>' +
+      '<section class="acard"><h3>Status</h3><p class="desc">Live connection and the model answering you.</p>' +
+        '<div class="row"><span class="dot ' + (db.ok === true ? 'ok' : db.ok === false ? 'bad' : '') + '"></span><span id="dbtext">' + esc(db.text) + '</span></div>' +
+        '<div class="row"><span>Model</span><span class="val">' + esc(s.model_label || s.model || '') + '</span></div>' +
+        '<div class="row"><span>Answers</span><span class="val">' + (s.provider === 'ollama' ? 'local, nothing leaves this PC' : 'Claude API, read-only data') + '</span></div>' +
+        '<div class="row"><span>This conversation</span><span class="val">' + (s.provider === 'ollama' ? '$0' : money(s.session_cost)) + '</span></div></section>' +
+      '<section class="acard"><h3>Spend today</h3><p class="desc">Hard daily limits protect the budget.</p>' +
+        '<div class="row"><span>You</span><span class="val">' + money(s.my_spent_today) + ' of $' + Number(s.my_budget || 0).toFixed(2) + '</span></div><div class="bar"><i style="width:' + myPct.toFixed(1) + '%"></i></div>' +
+        '<div class="row" style="margin-top:14px"><span>Everyone</span><span class="val">' + money(s.spent_today) + ' of $' + Number(s.budget || 0).toFixed(2) + '</span></div><div class="bar"><i style="width:' + spentPct.toFixed(1) + '%"></i></div></section>' +
+      '<section class="acard"><h3>Preferences</h3><p class="desc">Saved in this browser.</p>' +
+        '<div class="toggle"><div class="l">Dark mode<small>Easy on the eyes at night.</small></div><button class="switch ' + (theme === 'dark' ? 'on' : '') + '" id="p-theme" aria-label="Dark mode"></button></div>' +
+        (me.show_sql ? '<div class="toggle"><div class="l">Show the queries<small>See the SQL and result grids behind every answer.</small></div><button class="switch ' + (showSql ? 'on' : '') + '" id="p-sql" aria-label="Show queries"></button></div>' : '') + '</section>' +
+      '<section class="acard"><h3>Account</h3><p class="desc">' + (isErpLogin ? 'You signed in with your ERP password; change it in the ERP.' : 'Your app password.') + '</p><div class="btnrow">' + (isErpLogin ? '' : '<button class="btn ghost" id="p-pw">Change password</button>') + '<button class="btn danger" id="p-logout">Sign out</button></div></section>' +
+      (me.role === 'admin' ? '<section class="acard"><h3>Administration</h3><p class="desc">Users, ERP group mapping, model and cost, learned knowledge, feedback, security and the audit log.</p><div class="btnrow"><button class="btn" id="p-admin">Open admin panel</button></div></section>' : '') +
+      '</div>';
+    $('#p-theme').onclick = e => { applyTheme(theme === 'dark' ? 'light' : 'dark'); e.currentTarget.classList.toggle('on', theme === 'dark'); };
+    const ps = $('#p-sql'); if (ps) ps.onclick = e => { showSql = !showSql; store.set('showSql', showSql ? '1' : '0'); applySqlPref(); e.currentTarget.classList.toggle('on', showSql); };
+    const pw = $('#p-pw'); if (pw) pw.onclick = openPw;
+    $('#p-logout').onclick = async () => { try { await post('/api/logout'); } catch (e) {} location.reload(); };
+    const pa = $('#p-admin'); if (pa) pa.onclick = () => showView('admin');
+    if (fetchDb) checkDb();
+  }
 
   /* ---------- change password ---------- */
-  $('#pwbtn').onclick = () => {
-    if (me && me.erp_user && me.user === String(me.erp_user).toLowerCase()) { toast('You signed in with ERP credentials; change the password in the ERP.', 3500); return; }
-    $('#pwmodal').hidden = false; $('#pwerr').textContent = ''; $('#pwcur').value = $('#pwnew').value = ''; setTimeout(() => $('#pwcur').focus(), 50);
-  };
+  function openPw() { $('#pwmodal').hidden = false; $('#pwerr').textContent = ''; $('#pwcur').value = $('#pwnew').value = ''; setTimeout(() => $('#pwcur').focus(), 50); }
   $('#pwcancel').onclick = () => { $('#pwmodal').hidden = true; };
   $('#pwform').onsubmit = async e => {
     e.preventDefault();
@@ -337,27 +386,27 @@
   /* ---------- admin panel ---------- */
   let ov = null, groupsData = null;
   async function loadAdmin() {
-    const box = $('#admin-content'); box.innerHTML = '<div class="working"><span class="spin"></span>Loading…</div>';
+    const box = $('#admin-content'); box.innerHTML = '<div class="working"><span class="orb"></span>Loading…</div>';
     try { const r = await api('/api/admin/overview'); if (!r.ok) throw new Error((await r.json()).error || 'failed'); ov = await r.json(); }
     catch (e) { box.innerHTML = '<div class="errcard">' + esc(e.message) + '</div>'; return; }
     groupsData = null;
     try { const g = await api('/api/admin/groups'); if (g.ok) groupsData = await g.json(); else groupsData = { error: (await g.json()).error }; } catch (e) { groupsData = { error: 'ERP not reachable' }; }
     renderAdmin();
   }
-  function card(title, desc, bodyHtml) { return '<section class="acard"><h3>' + title + '</h3><p class="desc">' + desc + '</p>' + bodyHtml + '</section>'; }
+  function card(title, desc, bodyHtml) { return '<section class="acard wide"><h3>' + title + '</h3><p class="desc">' + desc + '</p>' + bodyHtml + '</section>'; }
   function renderAdmin() {
     const s = ov.settings, u = ov.usage, sec = ov.security, c = ov.costs, erp = ov.erp || { admin_users: [], modules: [] };
-    const usersHtml = '<table class="tbl"><thead><tr><th>User</th><th>Role</th><th>ERP link</th><th>Created</th><th>Last sign-in</th><th></th></tr></thead><tbody>' +
+    const usersHtml = '<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>User</th><th>Role</th><th>ERP link</th><th>Created</th><th>Last sign-in</th><th></th></tr></thead><tbody>' +
       ov.users.map(x => '<tr><td><b>' + esc(x.username) + '</b></td><td><span class="badge ' + (x.role === 'admin' ? '' : 'user') + '">' + x.role + '</span></td><td>' + (x.erp_user ? esc(x.erp_user) : '<span class="badge mod">default modules</span>') + '</td><td>' + esc(x.created || '') + '</td><td>' + esc(x.last_login || 'never') + '</td>' +
         '<td class="acts"><button class="mini" data-act="link" data-u="' + esc(x.username) + '" data-erp="' + esc(x.erp_user || '') + '">ERP link</button><button class="mini" data-act="password" data-u="' + esc(x.username) + '">Reset password</button><button class="mini" data-act="role" data-u="' + esc(x.username) + '" data-role="' + (x.role === 'admin' ? 'user' : 'admin') + '">Make ' + (x.role === 'admin' ? 'user' : 'admin') + '</button><button class="mini danger" data-act="delete" data-u="' + esc(x.username) + '">Delete</button></td></tr>').join('') +
-      '</tbody></table>' +
+      '</tbody></table></div>' +
       '<form id="adduser" class="form-inline five"><div class="field"><label>New username</label><input name="username" required minlength="3" autocomplete="off"></div><div class="field"><label>Password (min 8)</label><input name="password" type="password" required minlength="8" autocomplete="new-password"></div><div class="field"><label>ERP username (optional)</label><input name="erp_user" placeholder="ERP login id" autocomplete="off"></div><div class="field"><label>Role</label><select name="role"><option value="user">user</option><option value="admin">admin</option></select></div><button class="btn" type="submit">Add user</button></form><div class="form-err" id="usererr"></div>' +
       '<p class="desc" style="margin-top:10px">ERP sign-in is ' + (s.erp_login ? 'ON: anyone with an active ERP account can sign in with their ERP username and password; their modules come from their ERP groups.' : 'OFF: only the accounts above can sign in.') + ' Assistant admins by ERP username: <b>' + (erp.admin_users.length ? erp.admin_users.map(esc).join(', ') : 'none') + '</b>.</p>';
 
     const ol = ov.ollama || { alive: false, models: [] };
     const providerHtml = '<div class="settings-grid" style="margin-bottom:12px"><div class="field"><label>Answering model</label><select id="s-provider"><option value="anthropic" ' + (s.provider !== 'ollama' ? 'selected' : '') + '>Claude API (Anthropic)</option><option value="ollama" ' + (s.provider === 'ollama' ? 'selected' : '') + '>Local model via Ollama (nothing leaves this PC)</option></select></div>' +
       '<div class="field"><label>Local model name</label><input id="s-omodel" value="' + esc(s.ollama_model || '') + '" placeholder="qwen3:8b"></div><div class="field"><label>Ollama URL</label><input id="s-ourl" value="' + esc(s.ollama_url || '') + '"></div></div>' +
-      '<p class="desc">' + (ol.alive ? 'Ollama is running at ' + esc(ol.url) + '. Downloaded models: <b>' + (ol.models.length ? ol.models.map(esc).join(', ') : 'none yet (run: ollama pull ' + esc(s.ollama_model || 'qwen3:8b') + ')') + '</b>. Local answers cost $0 and are slower on a PC without a GPU.' : 'Ollama is not running on this PC. Start it (or install from ollama.com) to use a local model.') + '</p>';
+      '<p class="desc">' + (ol.alive ? 'Ollama is running at ' + esc(ol.url) + '. Downloaded models: <b>' + (ol.models.length ? ol.models.map(esc).join(', ') : 'none yet (run: ollama pull ' + esc(s.ollama_model || 'qwen3:8b') + ')') + '</b>. Local answers cost $0 but take 1-3 minutes on a PC without a GPU; the Claude API answers in seconds.' : 'Ollama is not running on this PC. Start it (or install from ollama.com) to use a local model.') + '</p>';
     const modelsHtml = providerHtml + '<p class="desc" style="margin:0 0 6px"><b>Claude models</b> (used when the answering model is the Claude API):</p><div class="models">' + c.models.map(m => '<div class="model ' + (m.model === s.model ? 'sel' : '') + '" data-model="' + m.model + '"><b>' + esc(m.label) + '</b><div class="note">' + esc(m.note) + '</div><div class="nums"><span>per question <b>' + money(m.per_question) + '</b></span><span>10/day <b>$' + m.monthly_10_per_day.toFixed(0) + '/mo</b></span><span>50/day <b>$' + m.monthly_50_per_day.toFixed(0) + '/mo</b></span></div></div>').join('') + '</div>' +
       '<p class="desc">Estimates from the measured token profile of your last ' + c.profile.sample + ' questions (about ' + c.profile.cache_read.toLocaleString() + ' cached + ' + c.profile.uncached_input.toLocaleString() + ' fresh input tokens and ' + c.profile.output + ' output tokens per question).</p>' +
       '<div class="settings-grid">' +
@@ -380,17 +429,17 @@
         '</tbody></table></div><div class="save-row"><button class="btn" id="savegroups">Save group mapping</button><span class="msg" id="groupsmsg"></span></div>';
     }
 
-    const usageHtml = '<div class="kpis"><div class="kpi"><div class="l">Today</div><div class="v">' + money(u.today) + '</div></div><div class="kpi"><div class="l">Last 7 days</div><div class="v">' + money(u.last7) + '</div></div><div class="kpi"><div class="l">Last 30 days</div><div class="v">' + money(u.last30) + '</div></div><div class="kpi"><div class="l">Questions today</div><div class="v">' + u.questions_today + '</div></div><div class="kpi"><div class="l">Questions total</div><div class="v">' + u.questions_total + '</div></div></div>' +
+    const usageHtml = '<div class="kpis"><div class="kpi"><div class="l">Today</div><div class="v">' + money(u.today) + '</div></div><div class="kpi"><div class="l">Last 7 days</div><div class="v">' + money(u.last7) + '</div></div><div class="kpi"><div class="l">Last 30 days</div><div class="v">' + money(u.last30) + '</div></div><div class="kpi"><div class="l">Questions today</div><div class="v">' + u.questions_today + '</div></div><div class="kpi"><div class="l">Questions total</div><div class="v">' + u.questions_total + '</div></div><div class="kpi"><div class="l">Local ($0)</div><div class="v">' + (u.local_questions || 0) + '</div></div></div>' +
       (Object.keys(u.by_user_today).length ? '<table class="tbl"><thead><tr><th>User</th><th>Spent today</th></tr></thead><tbody>' + Object.entries(u.by_user_today).map(([k, v]) => '<tr><td>' + esc(k) + '</td><td>' + money(v) + '</td></tr>').join('') + '</tbody></table>' : '<p class="desc">No questions yet today.</p>');
 
     const knHtml = (ov.knowledge.length ? ov.knowledge.slice().reverse().map(n => '<div class="note-item"><span class="badge">' + esc(n.kind) + '</span><div class="txt">' + esc(n.text) + '<div class="m">' + esc(n.by) + ' · ' + esc(n.ts) + (n.question ? ' · from: ' + esc(n.question) : '') + '</div></div><button class="mini danger" data-note="' + n.id + '">Delete</button></div>').join('') : '<p class="desc">Nothing learned yet.</p>') +
-      '<form id="addnote" class="form-inline" style="grid-template-columns:140px 1fr auto;align-items:start"><div class="field"><label>Kind</label><select name="kind"><option>rule</option><option>table</option><option>join</option><option>example</option><option>correction</option></select></div><div class="field"><label>Teach it something (free, no AI call)</label><textarea name="text" placeholder="e.g. MREQWORKFLOW.STATUS = C means closed. Approvals are level 1..6; a blank level means a higher authority covered it." required minlength="8"></textarea></div><button class="btn" type="submit">Save</button></form><div class="form-err" id="noteerr"></div>';
+      '<form id="addnote" class="form-inline" style="grid-template-columns:140px 1fr auto;align-items:start"><div class="field"><label>Kind</label><select name="kind"><option>rule</option><option>table</option><option>join</option><option>example</option><option>correction</option></select></div><div class="field"><label>Teach it something (free, no AI call)</label><textarea name="text" placeholder="e.g. STATUS = C means closed. Approvals are level 1..6; a blank level means a higher authority covered it." required minlength="8"></textarea></div><button class="btn" type="submit">Save</button></form><div class="form-err" id="noteerr"></div>';
 
-    const fbHtml = ov.feedback.length ? '<table class="tbl"><thead><tr><th>When</th><th>User</th><th>Vote</th><th>Question</th><th>Comment</th></tr></thead><tbody>' + ov.feedback.map(f => '<tr><td>' + esc(f.ts.replace('T', ' ')) + '</td><td>' + esc(f.user) + '</td><td><span class="badge ' + f.vote + '">' + f.vote + '</span></td><td>' + esc(f.question) + '</td><td>' + esc(f.text || '') + '</td></tr>').join('') + '</tbody></table>' : '<p class="desc">No feedback yet.</p>';
+    const fbHtml = ov.feedback.length ? '<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>When</th><th>User</th><th>Vote</th><th>Question</th><th>Comment</th></tr></thead><tbody>' + ov.feedback.map(f => '<tr><td>' + esc(f.ts.replace('T', ' ')) + '</td><td>' + esc(f.user) + '</td><td><span class="badge ' + f.vote + '">' + f.vote + '</span></td><td>' + esc(f.question) + '</td><td>' + esc(f.text || '') + '</td></tr>').join('') + '</tbody></table></div>' : '<p class="desc">No feedback yet.</p>';
     const secHtml = '<div class="kpis"><div class="kpi"><div class="l">Active sessions</div><div class="v">' + sec.active_sessions + '</div></div><div class="kpi"><div class="l">Failed sign-ins, 24 h</div><div class="v">' + sec.failed_logins_24h + '</div></div><div class="kpi"><div class="l">Locked accounts</div><div class="v">' + sec.locked_accounts + '</div></div></div><ul class="seclist">' + sec.notes.map(n => '<li>' + esc(n) + '</li>').join('') + '</ul>';
     const auditHtml = '<div class="audit">' + esc(ov.audit.map(a => a.ts.replace('T', ' ') + '  ' + (a.event + '').padEnd(20) + ' ' + (a.user || '-').padEnd(12) + ' ' + Object.entries(a).filter(([k]) => !['ts', 'event', 'user'].includes(k)).map(([k, v]) => k + '=' + (typeof v === 'string' ? v.slice(0, 80) : JSON.stringify(v))).join(' ')).join('\n')) + '</div>';
 
-    $('#admin-content').innerHTML =
+    $('#admin-content').innerHTML = '<div class="pcards">' +
       card('Users &amp; sign-in', 'App accounts, ERP links and who is an assistant admin.', usersHtml) +
       card('ERP groups &rarr; modules', 'Roles and responsibilities come from the ERP. This table decides which modules each ERP group may ask about; the tables behind each module are enforced on every query.', groupsHtml) +
       card('Model &amp; cost', 'Pick the model that fits the budget. Fewer rows to the model means cheaper and faster answers.', modelsHtml) +
@@ -398,7 +447,7 @@
       card('Learned knowledge', 'Teach the assistant here for free. Everything saved is added to its instructions for everyone.', knHtml) +
       card('Feedback', 'Thumbs up/down from all users. Admin thumbs-down with a correction becomes a learned note automatically.', fbHtml) +
       card('Security', 'What protects this application.', secHtml) +
-      card('Audit log', 'Last 40 events from logs/audit.jsonl.', auditHtml);
+      card('Audit log', 'Last 40 events from logs/audit.jsonl.', auditHtml) + '</div>';
 
     $$('#admin-content .model').forEach(m => m.onclick = () => { $$('#admin-content .model').forEach(x => x.classList.remove('sel')); m.classList.add('sel'); });
     $('#savesettings').onclick = async () => {

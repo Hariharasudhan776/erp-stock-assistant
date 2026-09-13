@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import secrets
 import sys
 import threading
+import time
 import webbrowser
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,8 +39,9 @@ STATIC = ROOT / "static"
 COOKIE = "adk_session"
 MAX_BODY = 64 * 1024
 
-_chats: dict[str, Chat] = {}  # session token -> conversation
+_chats: dict[str, dict] = {}  # session token -> {"convs": {id: Chat}, "order": [ids], "active": id}
 _chats_lock = threading.Lock()
+MAX_CONVERSATIONS = 30
 
 SECURITY_NOTES = [
     "Sign-in required for every page action and API call; passwords stored as salted PBKDF2-SHA256 hashes (600k iterations), never in plain text.",
@@ -64,13 +67,72 @@ CSP = (  # the page loads nothing from the internet: scripts, styles and fonts a
 )
 
 
-def _chat_for(token: str, sess: dict) -> Chat:
+def _state(token: str, sess: dict) -> dict:
+    """The conversation set of one signed-in session (created on first use)."""
+    st = _chats.get(token)
+    if st is None or st.get("user") != sess["user"] or st.get("role") != sess["role"]:
+        st = {"user": sess["user"], "role": sess["role"], "convs": {}, "order": [], "active": None}
+        _chats[token] = st
+    if not st["active"]:
+        _new_conv_locked(st, sess)
+    return st
+
+
+def _new_conv_locked(st: dict, sess: dict) -> str:
+    cid = secrets.token_hex(6)
+    c = Chat(sess["user"], sess["role"], access=sess.get("access"))
+    c.created = time.time()
+    st["convs"][cid] = c
+    st["order"].insert(0, cid)
+    st["active"] = cid
+    while len(st["order"]) > MAX_CONVERSATIONS:  # forget the oldest
+        old = st["order"].pop()
+        st["convs"].pop(old, None)
+    return cid
+
+
+def _chat_for(token: str, sess: dict, cid: str | None = None) -> Chat:
     with _chats_lock:
-        c = _chats.get(token)
-        if c is None or c.user != sess["user"] or c.role != sess["role"]:
-            c = Chat(sess["user"], sess["role"], access=sess.get("access"))
-            _chats[token] = c
-        return c
+        st = _state(token, sess)
+        cid = cid if cid in st["convs"] else st["active"]
+        return st["convs"][cid]
+
+
+def _conversations(token: str, sess: dict) -> dict:
+    with _chats_lock:
+        st = _state(token, sess)
+        out = []
+        for cid in st["order"]:
+            c = st["convs"][cid]
+            first = c.turn_log[0]["q"] if c.turn_log else ""
+            out.append({"id": cid, "title": (first[:60] + ("..." if len(first) > 60 else "")) or "New conversation",
+                        "turns": len(c.turn_log), "cost": round(c.session_cost, 4),
+                        "started": time.strftime("%H:%M", time.localtime(getattr(c, "created", time.time()))),
+                        "active": cid == st["active"]})
+        return {"active": st["active"], "conversations": out}
+
+
+def _conv_action(token: str, sess: dict, action: str, cid: str | None) -> dict:
+    with _chats_lock:
+        st = _state(token, sess)
+        if action == "new":
+            active = st["convs"][st["active"]]
+            if not active.turn_log:  # an empty conversation is already "new"
+                pass
+            else:
+                _new_conv_locked(st, sess)
+        elif action == "switch" and cid in st["convs"]:
+            st["active"] = cid
+        elif action == "delete" and cid in st["convs"]:
+            st["convs"].pop(cid, None)
+            st["order"].remove(cid)
+            if st["active"] == cid:
+                st["active"] = st["order"][0] if st["order"] else None
+                if not st["active"]:
+                    _new_conv_locked(st, sess)
+        else:
+            raise ValueError("unknown conversation action")
+    return _conversations(token, sess)
 
 
 def _drop_chat(token: str | None) -> None:
@@ -202,8 +264,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path == "/api/status":
             return self._json(chat.status())
+        if u.path == "/api/conversations":
+            return self._json(_conversations(self._token(), sess))
         if u.path == "/api/history":
-            return self._json(chat.history())
+            q = parse_qs(u.query)
+            chat = _chat_for(self._token(), sess, (q.get("c") or [None])[0])
+            h = chat.history()
+            h["conversation"] = next((c["id"] for c in _conversations(self._token(), sess)["conversations"] if c["active"]), None)
+            return self._json(h)
         if u.path == "/api/dbcheck":
             try:
                 res = db.run_select("select sysdate now, user usr from dual", role="admin", max_rows=1)
@@ -212,6 +280,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": str(e).splitlines()[0][:200]}, 500)
         if u.path == "/api/csv":
             q = parse_qs(u.query)
+            chat = _chat_for(self._token(), sess, (q.get("c") or [None])[0])
             try:
                 idx = int(q.get("i", ["-1"])[0])
                 name, text = chat.result_csv(idx)
@@ -314,11 +383,14 @@ class Handler(BaseHTTPRequestHandler):
             store.audit("password_changed", user, ip=ip)
             return self._json({"ok": True, "signed_out": True})
 
-        chat = _chat_for(token, sess)
-        if u.path == "/api/reset":
-            _drop_chat(token)
-            _chat_for(token, sess)
-            return self._json({"ok": True})
+        if u.path == "/api/conversations":
+            try:
+                return self._json({"ok": True, **_conv_action(token, sess, str(body.get("action", "")), body.get("id"))})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+        if u.path == "/api/reset":  # kept for the old page: start a fresh conversation
+            return self._json({"ok": True, **_conv_action(token, sess, "new", None)})
+        chat = _chat_for(token, sess, body.get("conversation"))
         if u.path == "/api/feedback":
             try:
                 res = chat.feedback(int(body.get("turn", -1)), str(body.get("vote", "")), str(body.get("text", ""))[:2000])
@@ -337,13 +409,31 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
 
+            wlock = threading.Lock()
+            done = threading.Event()
+            t_start = time.time()
+
             def emit(ev: dict):
                 try:
-                    self.wfile.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode("utf-8"))
-                    self.wfile.flush()
+                    with wlock:
+                        self.wfile.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                        self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     raise _ClientGone()
 
+            def heartbeat():  # keeps tunnels/proxies from dropping a silent stream and lets the page show a timer
+                while not done.wait(8):
+                    try:
+                        with wlock:
+                            if done.is_set():  # never write after the answer finished (the socket may be reused)
+                                return
+                            ping = {"type": "ping", "elapsed": int(time.time() - t_start)}
+                            self.wfile.write(("data: " + json.dumps(ping) + "\n\n").encode("utf-8"))
+                            self.wfile.flush()
+                    except OSError:
+                        return
+
+            threading.Thread(target=heartbeat, daemon=True).start()
             try:
                 chat.ask(question, emit)
             except _ClientGone:
@@ -355,6 +445,9 @@ class Handler(BaseHTTPRequestHandler):
                     emit({"type": "error", "text": "Something went wrong on the server. The admin can check the audit log."})
                 except _ClientGone:
                     pass
+            finally:
+                with wlock:
+                    done.set()
             return
 
         # ---- admin ----

@@ -20,10 +20,15 @@ single-page web UI streams the query, the result grid and the answer as they arr
 - **Multi-turn**: follow-up questions keep context ("and only for the main company?").
 - **Streaming UI**: answers render while the model is still working; Esc stops a question and
   the half-finished exchange is discarded server-side so the history never breaks.
-- **Refresh-safe**: the conversation is rebuilt from the server on reload.
+- **Refresh-safe**: conversations are rebuilt from the server on reload.
+- **Several conversations per sign-in**: the sidebar holds only your conversations (start,
+  switch, delete); each keeps its own context and cost.
+- **Tunnel-proof streaming**: the server sends a heartbeat every few seconds while the model
+  works, so proxies and tunnels never drop a long answer, and the page shows a live timer.
 - **Cost controls**: the schema notes are a cached system prompt, per-question cost is shown,
   spend is logged, and a daily budget hard-stops the API.
-- **Single-file front end**: question library, recents, live status card, light and dark themes.
+- **Vanilla front end, zero external resources**: question library in the empty state, a profile
+  page with status, spend, preferences, account and the admin entry, light and dark themes.
 
 ## Users, roles and the admin panel
 
@@ -50,7 +55,7 @@ The restriction is not a prompt trick: every SQL statement from a `user` session
 server-side table allow-list of their modules, and the Oracle data dictionary is blocked for
 them. Credential tables and password columns are unreadable for every role, admins included.
 
-The admin panel (shield button in the sidebar) shows users, model choice with a live cost
+The admin panel (Profile > Admin panel) shows users, model choice with a live cost
 table computed from your own usage, budgets, learned knowledge, feedback, security posture and
 the audit log.
 
@@ -201,7 +206,7 @@ applies to remote visitors.
 | `store.py` | runtime settings, learned knowledge, feedback and audit stores |
 | `agent.py` | Claude tool loop, role-aware tools, cost accounting, history trimming, learning |
 | `db.py` | connection, SELECT validator, capped execution, schema helpers |
-| `static/index.html`, `app.js`, `app.css` | the front end (sign-in, chat, admin panel) |
+| `static/index.html`, `app.js`, `app.css` | the front end (sign-in, conversations, profile page, admin panel) |
 | `knowledge_example.py` | template for the schema notes (copy to `knowledge.py`) |
 | `manage.py` | command-line user management |
 | `config.py` | `.env` loader |

@@ -57,7 +57,7 @@ Stock on hand by store for an item:
 # ---------------------------------------------------------------------------
 # Deployment-specific configuration (replace in your private knowledge.py)
 # ---------------------------------------------------------------------------
-BRAND = {"name": "Stock Assistant", "subtitle": "ERP - read-only"}
+BRAND = {"name": "ERP Insight", "subtitle": "ERP intelligence - read-only - live data"}
 
 # Sidebar question library: title, icon (box|move|truck|warn|site), questions
 LIBRARY = [
