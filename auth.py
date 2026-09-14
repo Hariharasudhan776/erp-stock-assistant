@@ -249,7 +249,8 @@ def _access_for(app_role: str, erp_user: str | None) -> tuple[str, dict]:
         if r["exists"]:
             if r["is_admin"]:
                 return "admin", {"erp_user": r["erp_user"], "groups": r["groups"], "modules": list(erp_roles.MODULES), "tables": [], "source": "erp-admin"}
-            return "user", {"erp_user": r["erp_user"], "groups": r["groups"], "modules": r["modules"], "tables": r["tables"], "source": "erp"}
+            return "user", {"erp_user": r["erp_user"], "groups": r["groups"], "modules": r["modules"], "tables": r["tables"],
+                            "screens": r.get("screens"), "source": "erp"}
     return "user", _default_access()
 
 
@@ -299,7 +300,8 @@ def authenticate(username: str, password: str, ip: str) -> tuple[str | None, str
                     role = "admin" if r["is_admin"] else "user"
                     access = {"erp_user": r["erp_user"], "groups": r["groups"],
                               "modules": list(erp_roles.MODULES) if role == "admin" else r["modules"],
-                              "tables": [] if role == "admin" else r["tables"], "source": "erp-login"}
+                              "tables": [] if role == "admin" else r["tables"],
+                              "screens": None if role == "admin" else r.get("screens"), "source": "erp-login"}
                     with _lock:
                         _clear_fails(username, ip)
                     return _new_session(r["erp_user"].lower(), role, access, ip), role

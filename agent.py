@@ -231,13 +231,13 @@ def current_provider(s: dict | None = None):
     return providers.AnthropicProvider(CFG.anthropic_api_key, s["model"], s["effort"])
 
 
-def system_blocks_for(provider_name: str, role: str, modules_info: list[dict]) -> list[dict]:
+def system_blocks_for(provider_name: str, role: str, modules_info: list[dict], screens: dict | None = None) -> list[dict]:
     """The system prompt as blocks: full briefing (cached) for Claude, compact briefing for local models."""
     learned = {"type": "text", "text": store.learned_prompt()}
     if provider_name == "anthropic":
         learned["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
     base = SYSTEM_PROMPT if provider_name == "anthropic" else SYSTEM_PROMPT_COMPACT
-    return [{"type": "text", "text": base}, learned, {"type": "text", "text": policy.role_prompt(role, modules_info)}]
+    return [{"type": "text", "text": base}, learned, {"type": "text", "text": policy.role_prompt(role, modules_info, screens)}]
 
 
 def warm_local(s: dict | None = None) -> None:
@@ -286,7 +286,7 @@ class Chat:
 
     # -- request shaping -------------------------------------------------
     def _system_blocks(self, provider_name: str) -> list[dict]:
-        return system_blocks_for(provider_name, self.role, self.modules_info)
+        return system_blocks_for(provider_name, self.role, self.modules_info, self.access.get("screens"))
 
     def _compact_history(self) -> None:
         last_q = None
@@ -339,21 +339,19 @@ class Chat:
                 emit({"type": "result", "index": len(self.results) - 1, **res.to_dict()})
                 rows_for_model = min(s["model_rows"], LOCAL_MODEL_ROWS) if s.get("provider") == "ollama" else s["model_rows"]
                 return res.as_text(max_rows=rows_for_model), False
-            if name in ("describe_table", "search_schema", "sample_rows") and role != "admin":
-                return policy.REFUSAL, True
             if name == "describe_table":
                 emit({"type": "tool", "name": name, "purpose": f"describe {inp.get('table', '')}"})
-                return db.describe_table(str(inp.get("table", "")), role=role), False
+                return db.describe_table(str(inp.get("table", "")), role=role, allowed_tables=self.allowed_tables), False
             if name == "search_schema":
                 emit({"type": "tool", "name": name, "purpose": f"search schema for {inp.get('keyword', '')}"})
-                return db.search_schema(str(inp.get("keyword", "")), role=role), False
+                return db.search_schema(str(inp.get("keyword", "")), role=role, allowed_tables=self.allowed_tables), False
             if name == "sample_rows":
                 emit({"type": "tool", "name": name, "purpose": f"sample {inp.get('table', '')}"})
                 try:
                     n = int(inp.get("n", 5))
                 except (TypeError, ValueError):
                     n = 5
-                return db.sample_rows(str(inp.get("table", "")), n, role=role), False
+                return db.sample_rows(str(inp.get("table", "")), n, role=role, allowed_tables=self.allowed_tables), False
             if name == "save_knowledge":
                 if role != "admin":
                     return "Not permitted for this user.", True
@@ -504,6 +502,9 @@ class Chat:
         except anthropic.RateLimitError:
             return self._fail(emit, "The AI service is rate-limited right now. Wait a minute and try again.")
         except anthropic.APIStatusError as e:
+            if "credit balance" in str(e).lower():
+                return self._fail(emit, "The Claude API account has no credit left. An admin must top up at console.anthropic.com "
+                                        "(Plans & Billing) or switch the answering model to the local model in the admin panel.")
             return self._fail(emit, f"AI service error {e.status_code}. Try again in a moment.")
         except anthropic.APIConnectionError:
             return self._fail(emit, "Cannot reach the AI service. Check the internet connection.")
@@ -602,6 +603,8 @@ class Chat:
             "session_cost": round(self.session_cost, 4), "turns": self.turns, "max_rows": s["max_rows"],
             "show_sql": self.role == "admin" or bool(s["show_sql_to_users"]),
             "erp_user": self.access.get("erp_user"),
+            "tables": len(self.allowed_tables) if self.allowed_tables is not None else None,
+            "screens": self.access.get("screens"),
             "modules": [m["label"] for m in self.modules_info if m.get("enabled")] if self.role != "admin" else ["all modules"],
             "groups": self.access.get("groups", []),
         }

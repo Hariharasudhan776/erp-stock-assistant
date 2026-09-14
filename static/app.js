@@ -349,6 +349,7 @@
       '<div class="identity"><div class="av big">' + esc(me.user.slice(0, 2).toUpperCase()) + '</div><div class="who"><h2>' + esc(me.user) + '</h2><div class="sub"><span class="badge ' + (me.role === 'admin' ? '' : 'user') + '">' + esc(me.role) + '</span> &nbsp; ' + (me.erp_user ? 'ERP account <b>' + esc(me.erp_user) + '</b>' : 'app account') + (isErpLogin ? ' · signed in with ERP credentials' : '') + '</div></div></div>' +
       '<div class="pcards">' +
       '<section class="acard"><h3>Access</h3><p class="desc">' + (me.role === 'admin' ? 'Administrator: every module, learning mode on.' : 'Modules you can ask about. Anything else gets the privileges message.') + '</p><div class="mods">' + (mods.length ? mods.map(m => '<span class="badge mod">' + esc(m) + '</span>').join('') : '<span class="badge mod">no modules yet</span>') + '</div>' +
+        (me.screens && me.screens.count ? '<p class="desc" style="margin:12px 0 0">Plus ' + me.screens.count + ' ERP screens you can open (' + (me.screens.tables || 0) + ' tables behind them), e.g. ' + esc((me.screens.captions || []).slice(0, 4).join(', ')) + '.</p>' : '') +
         ((me.groups || []).length ? '<p class="desc" style="margin:12px 0 6px">Your ERP groups</p><div class="mods">' + me.groups.map(g => '<span class="badge mod">' + esc(g) + '</span>').join('') + '</div>' : '') + '</section>' +
       '<section class="acard"><h3>Status</h3><p class="desc">Live connection and the model answering you.</p>' +
         '<div class="row"><span class="dot ' + (db.ok === true ? 'ok' : db.ok === false ? 'bad' : '') + '"></span><span id="dbtext">' + esc(db.text) + '</span></div>' +
@@ -426,7 +427,7 @@
       const mods = groupsData.modules;
       groupsHtml = '<p class="desc">' + groupsData.groups.length + ' ERP groups with active members. Tick the modules a group may ask about. Modules marked "not enabled" have no tables yet, so their members get the privileges message until the module is taught.</p>' +
         '<div class="gwrap"><table class="tbl gtbl"><thead><tr><th>ERP group</th><th>Members</th><th>Modules</th></tr></thead><tbody>' +
-        groupsData.groups.map(g => '<tr data-g="' + esc(g.group) + '"><td><b>' + esc(g.group) + '</b></td><td class="members">' + g.members + '</td><td>' + mods.map(m => '<label><input type="checkbox" value="' + esc(m.key) + '" ' + (g.modules.includes(m.key) ? 'checked' : '') + '> ' + esc(m.label) + (m.enabled ? '' : ' (not enabled)') + '</label>').join('') + '</td></tr>').join('') +
+        groupsData.groups.map(g => '<tr data-g="' + esc(g.group) + '"><td><b>' + esc(g.group) + '</b></td><td class="members">' + g.members + '</td><td>' + mods.map(m => '<label><input type="checkbox" value="' + esc(m.key) + '" ' + (g.modules.includes(m.key) ? 'checked' : '') + '> ' + esc(m.label) + (m.enabled ? '' : ' (not enabled)') + (m.admin_only ? ' (admins only)' : '') + '</label>').join('') + '</td></tr>').join('') +
         '</tbody></table></div><div class="save-row"><button class="btn" id="savegroups">Save group mapping</button><span class="msg" id="groupsmsg"></span></div>';
     }
 

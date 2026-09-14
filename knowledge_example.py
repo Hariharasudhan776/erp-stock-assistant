@@ -86,6 +86,17 @@ MODULES = {
 }
 GROUP_MODULES = {"StoreKeeper": ["stock"], "Purchase": ["purchasing"]}  # ERP group -> modules (case-insensitive)
 
+# Confidential personal data is never readable, for any role. Generic names (PASSPORT, SALARY, IBAN, DOB,
+# MOBILE, EMAIL...) are built in; add your ERP's own column and table names here.
+SENSITIVE_COLUMNS = []            # e.g. ["ACCOUNTNO", "NATIONALID", "HOMEPHONE"]
+SENSITIVE_TABLES = []             # whole tables that stay off limits, e.g. ["EMP_BANK_ACCOUNTS"]
+SENSITIVE_TABLE_PREFIXES = []     # e.g. ["SALARY", "PAYROLL"]
+# Tables carrying personal data: SELECT * is refused there and the confidential columns are blocked.
+EMPLOYEE_TABLES = []              # e.g. ["EMPLOYEE_MASTER"]
+EMPLOYEE_TABLE_PREFIXES = []      # e.g. ["EMP"]
+# A module may carry "admin_only": True - ERP groups mapped to it still get the privileges message until an
+# assistant admin asks; use it for employee data.
+
 
 # Compact briefing for small local models (keep it a fifth of SYSTEM_PROMPT or less).
 SYSTEM_PROMPT_COMPACT = SYSTEM_PROMPT

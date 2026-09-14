@@ -311,7 +311,8 @@ class Handler(BaseHTTPRequestHandler):
                 "ollama": _ollama_state(),
                 "erp": {
                     "admin_users": sorted(erp_roles.ADMIN_ERP_USERS),
-                    "modules": [{"key": k, "label": m.get("label", k), "enabled": bool(m.get("tables")), "tables": len(m.get("tables", []))} for k, m in erp_roles.MODULES.items()],
+                    "modules": [{"key": k, "label": m.get("label", k), "enabled": bool(m.get("tables")), "tables": len(m.get("tables", [])),
+                                 "admin_only": bool(m.get("admin_only"))} for k, m in erp_roles.MODULES.items()],
                 },
                 "security": {
                     "active_sessions": auth.active_sessions(),
@@ -335,7 +336,7 @@ class Handler(BaseHTTPRequestHandler):
             low = {k.lower(): v for k, v in mapping.items()}
             return self._json({
                 "groups": [{"group": g["group"], "members": g["members"], "modules": low.get(g["group"].lower(), [])} for g in groups],
-                "modules": [{"key": k, "label": m.get("label", k), "enabled": bool(m.get("tables"))} for k, m in erp_roles.MODULES.items()],
+                "modules": [{"key": k, "label": m.get("label", k), "enabled": bool(m.get("tables")), "admin_only": bool(m.get("admin_only"))} for k, m in erp_roles.MODULES.items()],
                 "overrides": store.group_overrides(),
             })
         return self._json({"error": "not found"}, 404)

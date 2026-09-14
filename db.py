@@ -256,11 +256,11 @@ def known_tables() -> set[str]:
     return _known
 
 
-def describe_table(name: str, role: str = "admin") -> str:
+def describe_table(name: str, role: str = "admin", allowed_tables=None) -> str:
     name = name.strip().upper().split(".")[-1]
     if not re.fullmatch(r"[A-Z0-9_$#]+", name):
         return f"Invalid table name: {name!r}"
-    if not policy.table_allowed(name, role):
+    if not policy.table_allowed(name, role, allowed_tables):
         return policy.REFUSAL
     owner = schema_owner()
     conn = connect()
@@ -294,13 +294,18 @@ def describe_table(name: str, role: str = "admin") -> str:
     lines = [f"{owner}.{name}"]
     if stat and stat[0] is not None:
         lines.append(f"~{int(stat[0]):,} rows (optimizer stats {fmt(stat[1])})")
+    if policy.is_employee_table(name):
+        hidden = [c for c in cols if c[0] in policy.SENSITIVE_COLUMNS]
+        cols = [c for c in cols if c[0] not in policy.SENSITIVE_COLUMNS]
+        if hidden:
+            lines.append(f"  ({len(hidden)} confidential columns hidden - they cannot be queried; never use SELECT * here)")
     for c, t, ln, nul in cols:
         typ = f"{t}({ln})" if ln else t
         lines.append(f"  {c} {typ}{'' if nul == 'Y' else ' NOT NULL'}")
     return "\n".join(lines)
 
 
-def search_schema(keyword: str, role: str = "admin", limit: int = 40) -> str:
+def search_schema(keyword: str, role: str = "admin", limit: int = 40, allowed_tables=None) -> str:
     """Find tables and columns whose name contains the keyword (restricted roles see only their tables)."""
     kw = keyword.strip().upper()
     if not kw or not re.fullmatch(r"[A-Z0-9_%$#]+", kw):
@@ -331,9 +336,9 @@ def search_schema(keyword: str, role: str = "admin", limit: int = 40) -> str:
             n=limit,
         )
         columns = cur.fetchall()
-    if role != "admin":
-        tables = [t for t in tables if policy.table_allowed(t[0], role)]
-        columns = [c for c in columns if policy.table_allowed(c[0], role)]
+    tables = [t for t in tables if policy.table_allowed(t[0], role, allowed_tables)]
+    columns = [c for c in columns if policy.table_allowed(c[0], role, allowed_tables)
+               and not (policy.is_employee_table(c[0]) and c[1] in policy.SENSITIVE_COLUMNS)]
     out = [f"Tables matching {kw} ({len(tables)} shown):"]
     out += [f"  {t}  ~{int(n):,} rows" if n is not None else f"  {t}" for t, n in tables] or ["  (none)"]
     out.append(f"Columns matching {kw} ({len(columns)} shown):")
@@ -341,15 +346,17 @@ def search_schema(keyword: str, role: str = "admin", limit: int = 40) -> str:
     return "\n".join(out)
 
 
-def sample_rows(table: str, n: int = 5, role: str = "admin") -> str:
+def sample_rows(table: str, n: int = 5, role: str = "admin", allowed_tables=None) -> str:
     table = table.strip().upper().split(".")[-1]
     if not re.fullmatch(r"[A-Z0-9_$#]+", table):
         return f"Invalid table name: {table!r}"
-    if not policy.table_allowed(table, role):
+    if not policy.table_allowed(table, role, allowed_tables):
         return policy.REFUSAL
+    if policy.is_employee_table(table):
+        return "Employee tables cannot be sampled (confidential columns). Use describe_table and select the non-confidential columns explicitly."
     n = max(1, min(int(n), 20))
     try:
-        res = run_select(f"select * from {table} fetch first {n} rows only", role=role, max_rows=n)
+        res = run_select(f"select * from {table} fetch first {n} rows only", role=role, max_rows=n, allowed_tables=allowed_tables)
     except (oracledb.Error, PermissionError) as e:
         return f"Error: {str(e).splitlines()[0]}"
     return res.as_text(max_width=40)

@@ -150,6 +150,8 @@ class OllamaProvider:
             out.append({"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": schema}})
         return out
 
+    _SQL_FENCE = re.compile(r"```(?:sql|oracle|plsql)?\s*((?:select|with)\b.*?)```", re.I | re.S)
+
     _CALL_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```|<tool_call>\s*(\{.*?\})\s*</tool_call>|(\{\s*\"name\"\s*:.*\})", re.S)
 
     @classmethod
@@ -177,6 +179,13 @@ class OllamaProvider:
                         args = {"_raw": args}
                 calls.append({"name": obj["name"], "input": args if isinstance(args, dict) else {}})
                 rest = rest.replace(m.group(0), "", 1)
+        if not calls and "run_sql" in tool_names:  # SQL written as prose instead of a tool call: run it
+            for m in cls._SQL_FENCE.finditer(text):
+                sql = m.group(1).strip().rstrip(";").strip()
+                if sql:
+                    calls.append({"name": "run_sql", "input": {"sql": sql, "purpose": "query written in the reply"}})
+                    rest = rest.replace(m.group(0), "", 1)
+                    break  # one statement per round keeps the loop predictable
         return rest.strip(), calls
 
     # -- call ----------------------------------------------------------------

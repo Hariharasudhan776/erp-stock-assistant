@@ -55,6 +55,19 @@ The restriction is not a prompt trick: every SQL statement from a `user` session
 server-side table allow-list of their modules, and the Oracle data dictionary is blocked for
 them. Credential tables and password columns are unreadable for every role, admins included.
 
+**Access derived from the ERP's own screens.** Besides the module mapping, the allow-list of a
+signed-in person is widened with the tables behind the ERP screens their groups can open: the
+rights table gives the transactions and report views (directly and through menu pages), a
+transaction's tables come from its stored definition, a report's from its SQL. System tables,
+backups and personal-data tables are never granted this way. So "anything outside your roles"
+is decided by the ERP itself, not by a hand-written list.
+
+**Confidential personal data is never shown to anyone.** Employee tables can only be read with
+explicit column lists (no `SELECT *`), and identity, bank, contact, address, date-of-birth,
+religion and salary columns - plus whole payroll and document tables - are rejected before
+reaching Oracle, for admins too. The employee module itself is `admin_only`: ERP HR groups keep
+getting the privileges message until an assistant admin opens it.
+
 The admin panel (Profile > Admin panel) shows users, model choice with a live cost
 table computed from your own usage, budgets, learned knowledge, feedback, security posture and
 the audit log.
@@ -206,7 +219,8 @@ applies to remote visitors.
 |---|---|
 | `app.py` | HTTP server: sign-in, sessions, streaming chat, CSV, feedback, admin API, security headers |
 | `auth.py` | users file, password hashing, sessions, lockout |
-| `policy.py` | role definitions, per-role table allow-list, role prompts |
+| `erp_roles.py` | ERP groups, group-to-module mapping, tables derived from ERP screen definitions, ERP-credential check |
+| `policy.py` | role definitions, per-role table allow-list, confidential-data guard, role prompts |
 | `store.py` | runtime settings, learned knowledge, feedback and audit stores |
 | `agent.py` | Claude tool loop, role-aware tools, cost accounting, history trimming, learning |
 | `db.py` | connection, SELECT validator, capped execution, schema helpers |
