@@ -511,7 +511,12 @@ def main() -> None:
         print("connected")
     except Exception as e:
         print("NOT connected:", str(e).splitlines()[0])
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    ThreadingHTTPServer.allow_reuse_address = False  # Windows would otherwise let a second copy share the port
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:
+        print(f"Port {port} is already in use: the app is probably still running in another window. Close it first (or set PORT in .env).")
+        sys.exit(1)
     httpd.daemon_threads = True
     url = f"http://127.0.0.1:{port}"
     s = store.settings()

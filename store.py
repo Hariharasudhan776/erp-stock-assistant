@@ -154,6 +154,9 @@ def add_note(kind: str, text: str, by: str, question: str | None = None) -> dict
             "ts": time.strftime("%Y-%m-%d %H:%M"), "question": (question or "").strip()[:300] or None}
     with _lock:
         cur = _read_json(KNOWLEDGE_FILE, [])
+        for n in cur:
+            if n.get("kind") == kind and n.get("text", "").strip() == text:
+                return n  # already saved: a looping model must not fill the knowledge base with copies
         cur.append(note)
         _write_json(KNOWLEDGE_FILE, cur)
     audit("knowledge_added", by, kind=kind, id=note["id"], chars=len(text))

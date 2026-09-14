@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 import threading
 import time
 from typing import Callable
@@ -31,6 +32,17 @@ except ImportError:  # fresh clone: start from the template and edit it
 SYSTEM_PROMPT = _kn.SYSTEM_PROMPT
 SYSTEM_PROMPT_COMPACT = getattr(_kn, "SYSTEM_PROMPT_COMPACT", SYSTEM_PROMPT)  # small local models get the short briefing
 LOCAL_MODEL_ROWS = 25  # a local model reads at most this many result rows (prompt growth is what costs time)
+LOCAL_MAX_ROUNDS = 4   # small local models loop on tools; stop them early
+NUDGE_NO_QUERY = ("Your answer contains figures but you ran no query in this turn. Numbers must come from run_sql. "
+                  "Call run_sql now with the SELECT that answers the question, then answer from its result.")
+UNVERIFIED = ("I could not verify this with a query, so I will not guess a figure. Please rephrase the question "
+              "(name the item, project or period), or ask the admin to switch the answering model to the Claude API.")
+SMALL_TALK = re.compile(r"^(hi+|hey+|hello+|helo|yo|hai|good (morning|afternoon|evening|night)|test(ing)?|ping|are you there\??)[\s!.?]*$", re.I)
+THANKS = re.compile(r"^(thanks?( you)?( so much)?( a lot)?|thank u|ok(ay)?( thanks)?|great|nice|perfect|cool|got it)[\s!.?]*$", re.I)
+THANKS_REPLY = "You're welcome! Ask whenever you need another figure."
+GREETING = ("Hello! I answer questions from the ERP with live, read-only data: stock on hand, movements, GRNs, "
+            "purchase orders, supplier bills and payments. Ask me something like *current stock of diesel by store* "
+            "or *total PO value for a project*.")
 
 # ---------------------------------------------------------------- pricing --
 # USD per 1M tokens: (input, output). Cache write (1h) = 2x input, cache read = 0.1x input.
@@ -204,6 +216,13 @@ TOOLS = [
 EventFn = Callable[[dict], None]
 
 
+def tools_for(provider_name: str) -> list[dict]:
+    """Local models get the query tools only; saving knowledge stays with Claude and the admin panel."""
+    if provider_name == "ollama":
+        return [t for t in TOOLS if t["name"] != "save_knowledge"]
+    return TOOLS
+
+
 def current_provider(s: dict | None = None):
     """The provider selected in settings (Claude API or a local Ollama model)."""
     s = s or store.settings()
@@ -231,7 +250,7 @@ def warm_local(s: dict | None = None) -> None:
         try:
             p = current_provider(s)
             t0 = time.time()
-            p.warm(system_blocks_for("ollama", "admin", []), TOOLS)
+            p.warm(system_blocks_for("ollama", "admin", []), tools_for("ollama"))
             store.audit("local_warmup", None, model=p.model, seconds=round(time.time() - t0, 1))
         except Exception as e:  # never break the app over a warm-up
             store.audit("local_warmup_failed", None, error=str(e)[:200])
@@ -371,6 +390,18 @@ class Chat:
 
         turn = {"q": question.strip(), "ts": _dt.datetime.now().isoformat(timespec="seconds"), "events": []}
         self.turn_log.append(turn)
+        canned = GREETING if SMALL_TALK.match(question.strip()) else THANKS_REPLY if THANKS.match(question.strip()) else None
+        if canned:  # no model call, no cost, instant
+            self.messages.append({"role": "user", "content": question.strip()})
+            self.messages.append({"role": "assistant", "content": canned})
+            final = {"type": "final", "text": canned, "cost": 0.0, "session_cost": round(self.session_cost, 4),
+                     "spent_today": round(spent_today(), 4), "budget": s["daily_budget_usd"], "usage": {}, "elapsed": 0.0,
+                     "model": "none", "provider": s.get("provider", "anthropic"), "turn": len(self.turn_log) - 1}
+            turn["events"].append(final)
+            emit({"type": "text_delta", "text": canned})
+            emit(final)
+            self.turns += 1
+            return canned
         raw_emit = emit
 
         def emit(ev: dict) -> None:
@@ -393,10 +424,12 @@ class Chat:
         final_text = ""
         t0 = time.time()
         rounds = 0
+        queries_this_turn = 0
+        nudged = False
         try:
             while True:
                 rounds += 1
-                if rounds > CFG.max_tool_rounds + 1:
+                if rounds > (LOCAL_MAX_ROUNDS if local else CFG.max_tool_rounds) + 1:
                     final_text = "I ran too many queries without reaching an answer. Please narrow the question."
                     emit({"type": "text_delta", "text": final_text})
                     self.messages.append({"role": "assistant", "content": final_text})
@@ -409,7 +442,7 @@ class Chat:
                     text_this_round.append(t)
                     emit({"type": "text_delta", "text": t})
 
-                reply = provider.stream(self._system_blocks(provider.name), TOOLS, self.messages, on_text)
+                reply = provider.stream(self._system_blocks(provider.name), tools_for(provider.name), self.messages, on_text)
                 if provider.name == "anthropic":
                     q_cost += cost_of(reply.model or model_name, reply.usage)
                 for k in usage_tot:
@@ -428,6 +461,8 @@ class Chat:
                             except ValueError:
                                 inp = {}
                         text, is_err = self._run_tool(block.get("name", ""), inp, emit, question)
+                        if block.get("name") == "run_sql" and not is_err:
+                            queries_this_turn += 1
                         tr = {"type": "tool_result", "tool_use_id": block.get("id", ""), "content": text}
                         if is_err:
                             tr["is_error"] = True
@@ -441,6 +476,19 @@ class Chat:
                     continue
 
                 final_text = "".join(text_this_round) or "".join(b.get("text", "") for b in reply.content if b.get("type") == "text")
+                if queries_this_turn == 0 and re.search(r"\d", final_text) and reply.stop_reason not in ("refusal", "max_tokens"):
+                    # figures without a query behind them are guesses; never show them
+                    if not nudged:
+                        nudged = True
+                        self.messages.append({"role": "user", "content": NUDGE_NO_QUERY})
+                        emit({"type": "text_reset"})  # the page drops the guessed text it has streamed so far
+                        emit({"type": "status", "text": "thinking"})
+                        continue
+                    store.audit("unverified_answer_blocked", self.user, provider=provider.name, model=model_name, text=final_text[:300])
+                    final_text = UNVERIFIED
+                    emit({"type": "text_delta", "text": final_text})
+                    self.messages.append({"role": "assistant", "content": final_text})
+                    break
                 if reply.stop_reason == "refusal":
                     why = f" ({reply.stop_details})" if reply.stop_details else ""
                     final_text = (final_text + f"\n\nThe model declined to answer this{why}.").strip()

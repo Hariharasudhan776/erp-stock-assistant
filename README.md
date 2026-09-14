@@ -172,14 +172,18 @@ Switch in the admin panel (Model & cost card) or in `data/settings.json`. The br
 external resources either: scripts, styles and fonts are served by the app, so with the local
 provider the only network traffic is browser, this server, and the Oracle database.
 
-Measured on an office PC with no GPU (Intel i5, 16 GB RAM, `qwen3:8b`): first answer about
-5 minutes, follow-ups about 90 seconds, and small-model mistakes on flags and joins. A 30B-class
-model on a 24 GB GPU is the realistic setup for daily use. Roles, allow-lists, learning and the
-audit log work identically with either provider, because they are enforced by the server, not by
-the model.
+Measured on an office PC with no GPU (Intel i5, 16 GB RAM, `qwen2.5-coder:7b`): about 20 seconds
+per model round once the prompt cache is warm, 90-115 seconds when it is cold, so 25-45 seconds for a
+typical answer. Small models also guess: the server therefore limits local models to four tool
+rounds, removes the knowledge-saving tool from them, recovers tool calls they print as JSON text,
+and refuses to show a figure that no query produced (the model is nudged once, then the user gets
+an honest "could not verify" instead of an invented number). Simple counts and stock questions work;
+multi-table finance questions are where a 7B model still fails. A 30B-class model on a 24 GB GPU is
+the realistic setup for daily local use. Roles, allow-lists, learning and the audit log work
+identically with either provider, because they are enforced by the server, not by the model.
 
 ```bash
-ollama pull qwen3:8b       # once; then pick "Local model via Ollama" in the admin panel
+ollama pull qwen2.5-coder:7b   # once; then pick "Local model via Ollama" in the admin panel
 ```
 
 ## Backups

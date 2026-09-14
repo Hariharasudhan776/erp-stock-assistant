@@ -28,7 +28,7 @@
   applyTheme(theme);
 
   /* ---------- branding ---------- */
-  let brand = { name: 'ERP Insight', subtitle: '', library: [] };
+  let brand = { name: 'ERP Pulse', subtitle: '', library: [] };
   async function loadBranding() {
     try { const j = await (await fetch('/api/branding')).json(); brand = Object.assign(brand, j.brand || {}, { library: j.library || [] }); } catch (e) {}
     document.title = brand.name; $$('.brandname').forEach(el => el.textContent = brand.name); $('#brandsub').textContent = brand.subtitle || 'read-only';
@@ -290,6 +290,7 @@
       case 'learned': showLearned(ctx, ev); break;
       case 'text_delta': ctx.text += ev.text; ctx.answer.hidden = false; ctx.amd.innerHTML = md(ctx.text); scrollDown(); break;
       case 'text_break': ctx.text += '\n\n'; break;
+      case 'text_reset': ctx.text = ''; ctx.amd.innerHTML = ''; ctx.answer.hidden = true; break;
       case 'error': finish(ctx); { const er = document.createElement('div'); er.className = 'errcard'; er.textContent = ev.text; ctx.body.insertBefore(er, ctx.foot); } break;
       case 'final':
         finish(ctx); ctx.turn = ev.turn;

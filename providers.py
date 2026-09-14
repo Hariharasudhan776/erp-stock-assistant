@@ -13,6 +13,7 @@ so roles, allow-lists, learning and the page work identically whichever model an
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -74,9 +75,36 @@ class AnthropicProvider:
 class OllamaProvider:
     name = "ollama"
 
-    def __init__(self, url: str = "http://127.0.0.1:11434", model: str = "qwen3:8b", num_ctx: int = 16384, timeout: float = 900.0) -> None:
+    def __init__(self, url: str = "http://127.0.0.1:11434", model: str = "qwen3:8b", num_ctx: int = 12288, timeout: float = 900.0) -> None:
         self.url = url.rstrip("/")
         self.model, self.num_ctx, self.timeout = model, num_ctx, timeout
+
+    _think_cache: dict[str, bool] = {}
+
+    def _supports_thinking(self) -> bool:
+        """Ollama rejects the 'think' flag for models without the thinking capability; ask once per model."""
+        hit = self._think_cache.get(self.model)
+        if hit is not None:
+            return hit
+        ok = False
+        try:
+            req = urllib.request.Request(self.url + "/api/show", data=json.dumps({"model": self.model}).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                ok = "thinking" in (json.loads(r.read()).get("capabilities") or [])
+        except (OSError, ValueError):
+            ok = "qwen3" in self.model or "deepseek-r1" in self.model
+        self._think_cache[self.model] = ok
+        return ok
+
+    def _base_body(self, num_predict: int | None = None) -> dict:
+        body: dict = {"model": self.model, "stream": True, "keep_alive": "60m",
+                      "options": {"num_ctx": self.num_ctx, "temperature": 0.1}}
+        if num_predict:
+            body["options"]["num_predict"] = num_predict
+        if self._supports_thinking():
+            body["think"] = False  # thinking models (Qwen3...) would spend minutes on CPU before answering
+        return body
 
     @property
     def label(self) -> str:
@@ -122,21 +150,46 @@ class OllamaProvider:
             out.append({"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": schema}})
         return out
 
+    _CALL_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```|<tool_call>\s*(\{.*?\})\s*</tool_call>|(\{\s*\"name\"\s*:.*\})", re.S)
+
+    @classmethod
+    def _recover_tool_calls(cls, text: str, tool_names: set[str]) -> tuple[str, list[dict]]:
+        """Small models sometimes print the call as JSON text; turn that back into tool calls."""
+        calls: list[dict] = []
+        rest = text
+        for m in cls._CALL_RE.finditer(text):
+            raw = next(g for g in m.groups() if g)
+            obj = None
+            for candidate in (raw, raw + "}", raw + "}}", raw + '"}}'):  # small models often drop the closing braces
+                try:
+                    obj = json.loads(candidate)
+                    break
+                except ValueError:
+                    continue
+            if obj is None:
+                continue
+            if isinstance(obj, dict) and obj.get("name") in tool_names:
+                args = obj.get("arguments") or obj.get("parameters") or obj.get("input") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = {"_raw": args}
+                calls.append({"name": obj["name"], "input": args if isinstance(args, dict) else {}})
+                rest = rest.replace(m.group(0), "", 1)
+        return rest.strip(), calls
+
     # -- call ----------------------------------------------------------------
     def stream(self, system_blocks: list[dict], tools: list[dict], messages: list[dict], on_text: OnText) -> Reply:
-        body = {
-            "model": self.model,
-            "messages": self._to_ollama(system_blocks, messages),
-            "tools": self._tools(tools),
-            "stream": True,
-            "think": False,  # thinking models (Qwen3...) would spend minutes on CPU before answering
-            "keep_alive": "60m",
-            "options": {"num_ctx": self.num_ctx, "temperature": 0.1},
-        }
+        body = self._base_body(num_predict=1200)  # an answer never needs more; runaway generation is what eats minutes
+        body["messages"] = self._to_ollama(system_blocks, messages)
+        body["tools"] = self._tools(tools)
         req = urllib.request.Request(self.url + "/api/chat", data=json.dumps(body).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
         text_parts: list[str] = []
         calls: list[dict] = []
+        held: bool | None = None  # True while the reply looks like a JSON tool call written as text
+        tool_names = {t["name"] for t in tools}
         usage = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
@@ -151,7 +204,14 @@ class OllamaProvider:
                     piece = msg.get("content") or ""
                     if piece:
                         text_parts.append(piece)
-                        on_text(piece)
+                        if held is None:  # decide once we can see how the reply starts
+                            head = "".join(text_parts).lstrip()
+                            if len(head) >= 3 or chunk.get("done"):
+                                held = head[:1] in ("`", "{", "<")
+                                if not held:
+                                    on_text("".join(text_parts))
+                        elif not held:
+                            on_text(piece)
                     for tc in msg.get("tool_calls") or []:
                         fn = tc.get("function") or {}
                         args = fn.get("arguments")
@@ -171,6 +231,10 @@ class OllamaProvider:
 
         content: list[dict] = []
         text = "".join(text_parts).strip()
+        if text and not calls:
+            text, calls = self._recover_tool_calls(text, tool_names)
+        if held and text and not calls:  # it looked like a call but was a normal answer: show it now
+            on_text(text)
         if text:
             content.append({"type": "text", "text": text})
         for i, c in enumerate(calls):
@@ -179,13 +243,10 @@ class OllamaProvider:
 
     def warm(self, system_blocks: list[dict], tools: list[dict]) -> None:
         """Send the exact prefix (system + tools) once so Ollama caches its processed form."""
-        body = {
-            "model": self.model,
-            "messages": self._to_ollama(system_blocks, [{"role": "user", "content": "Reply with the single word OK."}]),
-            "tools": self._tools(tools),
-            "stream": False, "think": False, "keep_alive": "60m",
-            "options": {"num_ctx": self.num_ctx, "temperature": 0.1, "num_predict": 3},
-        }
+        body = self._base_body(num_predict=3)
+        body["stream"] = False
+        body["messages"] = self._to_ollama(system_blocks, [{"role": "user", "content": "Reply with the single word OK."}])
+        body["tools"] = self._tools(tools)
         req = urllib.request.Request(self.url + "/api/chat", data=json.dumps(body).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
